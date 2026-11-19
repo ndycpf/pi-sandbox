@@ -8,6 +8,9 @@ import {
 import { Key } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
+import type { OuterWorkspace } from "./review-boundary.ts";
+
+import { registerBashReview } from "./bash-review.ts";
 import {
   addDomainToConfig,
   addReadPathToConfig,
@@ -48,6 +51,16 @@ import {
 import { registerUnsandboxBash } from "./unsandbox-bash.ts";
 
 export default function (pi: ExtensionAPI) {
+  registerSandbox(pi);
+}
+
+// Only an embedding provisioner can supply the restricted native execution capability.
+export function withOuterWorkspace(workspace: OuterWorkspace) {
+  return (pi: ExtensionAPI) => registerSandbox(pi, workspace);
+}
+
+function registerSandbox(pi: ExtensionAPI, workspace?: OuterWorkspace) {
+  const reviewBash = registerBashReview(pi, workspace);
   const sandboxManager = createSandboxManager();
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
@@ -328,7 +341,35 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     ...localBash,
     label: "bash (sandboxed)",
+    parameters: Type.Object({
+      ...localBash.parameters.properties,
+      sandbox_permissions: Type.Optional(
+        Type.Union([Type.Literal("use_default"), Type.Literal("require_escalated")], {
+          description: "Request one reviewed launch in the operator-provisioned outer workspace.",
+        }),
+      ),
+      justification: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
+    }),
     async execute(id, params, signal, onUpdate, ctx) {
+      if (Object.hasOwn(params, "review")) throw Error("Obsolete review argument; action refused.");
+      if (
+        params.sandbox_permissions !== undefined &&
+        params.sandbox_permissions !== "use_default"
+      ) {
+        if (params.sandbox_permissions !== "require_escalated")
+          throw Error("Unsupported sandbox permissions.");
+        const assessment = await reviewBash(
+          params.command,
+          params.justification ?? "",
+          signal,
+          ctx,
+          params.timeout,
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(assessment) }],
+          details: {},
+        };
+      }
       const runBash = () => {
         const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted });
         const userShellPath = settings.getShellPath();
@@ -404,6 +445,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    if (isToolCallEventType("bash", event)) {
+      if ("review" in event.input)
+        return { block: true, reason: "Obsolete review request; command refused." };
+      if ("sandbox_permissions" in event.input && event.input.sandbox_permissions !== "use_default")
+        return;
+    }
     if (!sandboxEnabled) return;
     const config = loadConfig(ctx.cwd, projectTrusted);
     if (!config.enabled) return;

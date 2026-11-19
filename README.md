@@ -269,3 +269,53 @@ Based on code from
 [badlogic/pi-mono](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/examples/extensions/sandbox/index.ts)
 by Mario Zechner, used under the
 [MIT License](https://github.com/badlogic/pi-mono/blob/main/LICENSE).
+
+
+### On-request Guardian and an outer workspace
+
+A `require_escalated` request is for one execution outside the ordinary Pi
+sandbox, inside an existing operator-provisioned workspace. The stock extension
+refuses it. Pi 0.80.10 exposes session identity, project trust and a local
+child-process runner, but no authenticated deployment identity or evidence
+about the runner's inherited restrictions. Neither a startup flag, a container
+marker nor WSL alone establishes that those restrictions are sufficient.
+
+An embedding provisioner may register `withOuterWorkspace(workspace)` instead
+of the default extension and select its exact identity with
+`--sandbox-review-workspace ID`. This is an integration contract. The
+provisioner must authenticate and pin one live container/VM incarnation and its
+execution policy independently of the project, and supply an execution capability
+scoped exclusively to it. Its native Bash runner must use the supplied argv and
+cwd with fixed deployment settings, check identity and directory at dispatch,
+honor cancellation/deadlines, and never redirect or retry on a host. Do not
+supply a generic local executor. The OpenSSH adapter targets a dedicated, existing Linux development VM.
+See [deployment and verification](adapters/ssh-workspace.md). No native VM
+run has been verified in this checkout.
+
+Set `--sandbox-review-prompt /absolute/operator/path/review.txt` at startup.
+Supply your own reviewer instructions in a regular UTF-8 file (1–65536 bytes)
+outside the workspace. Use its canonical path, protect the file and parent
+directories from agent writes, and keep it owned by the operator or root
+without group or other write permission. Pi captures it once when the extension
+starts. Missing or invalid input disables reviewed execution until restart.
+There is no default or download. The local file supplies the entire reviewer
+system message. The text should describe your authorization and risk policy
+and request a JSON verdict compatible with the parser in src/command-review.ts.
+
+Select an operator-trusted offline in-process Pi reviewer with
+`--sandbox-review-model PROVIDER/MODEL` (registered `streamSimple`, base URL
+`local://guardian`). The reviewer receives the exact proposed argv, cwd,
+boundary identity, timeout, justification and bounded unverified Pi user-role
+text. The same tool call dispatches the frozen action only on allow and while
+the session and workspace still match. Ordinary Bash and file controls continue
+to use their existing paths. The human approval tool remains independently
+available. No per-invocation image, second sandbox, automatic prompt or replay
+is involved.
+
+
+#### Attribution
+
+The assessment fields and parsing defaults are adapted from OpenAI Codex,
+revision `39c29c3bb620f91e84a3bb266bb496dfb697c101`, under Apache-2.0.
+The [license and upstream notice](third-party/openai-codex/) apply to that
+derived material. No upstream reviewer instructions are distributed.

@@ -3,4 +3,7 @@
  * by Mario Zechner, used under the MIT License.
  */
 
-export { default } from "./src/extension.ts";
+export { default, withOuterWorkspace } from "./src/extension.ts";
+export type { OuterWorkspace, ReviewedAction } from "./src/review-boundary.ts";
+
+export { sshWorkspace } from "./src/ssh-workspace.ts";

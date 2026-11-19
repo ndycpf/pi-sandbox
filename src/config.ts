@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, normalize } from "node:path";
 
 import { type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -18,6 +19,8 @@ export type SandboxConfig = Omit<SandboxRuntimeConfig, "network" | "filesystem">
   };
   enabled?: boolean;
   sandboxUserShell?: boolean;
+  filePermissionProvider?: string;
+  approvedProjectFiles?: Record<string, string>;
   enableAccessRequestTool?: boolean;
   permissionPromptTimeoutSeconds?: number;
   network?: NonNullable<SandboxRuntimeConfig["network"]> & {
@@ -119,6 +122,14 @@ export function mergeConfigLayers(
 
   return {
     ...merged,
+    approvedProjectFiles: globalConfig.approvedProjectFiles,
+    filePermissionProvider:
+      typeof globalConfig.filePermissionProvider === "string" &&
+      isAbsolute(globalConfig.filePermissionProvider) &&
+      !globalConfig.filePermissionProvider.includes("\0") &&
+      normalize(globalConfig.filePermissionProvider) === globalConfig.filePermissionProvider
+        ? globalConfig.filePermissionProvider
+        : undefined,
     // Cross-sandbox signals can affect unrelated host processes; only global config may grant them.
     allowProcessSignals: globalConfig.allowProcessSignals === true,
     network: {
@@ -213,22 +224,15 @@ export function stripJsonComments(input: string): string {
   return out;
 }
 
-function parseConfig(configPath: string): SandboxConfigFile {
-  const parsed: unknown = JSON.parse(stripJsonComments(readFileSync(configPath, "utf-8")));
+function parseConfig(
+  configPath: string,
+  text = readFileSync(configPath, "utf-8"),
+): SandboxConfigFile {
+  const parsed: unknown = JSON.parse(stripJsonComments(text));
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new Error("configuration must be a JSON object");
   }
   return parsed as SandboxConfigFile;
-}
-
-function readJsonConfig(configPath: string, warn: boolean): SandboxConfigFile {
-  if (!existsSync(configPath)) return {};
-  try {
-    return parseConfig(configPath);
-  } catch (error) {
-    if (warn) console.error(`Warning: Could not parse ${configPath}: ${error}`);
-    return {};
-  }
 }
 
 /**
@@ -256,49 +260,106 @@ export function getConfigPaths(cwd: string): { globalPath: string; projectPath: 
 }
 
 export function loadConfig(cwd: string, projectTrusted = true): SandboxConfig {
-  const { globalPath, projectPath } = getConfigPaths(cwd);
-  const globalConfig = readJsonConfig(globalPath, true);
-  const projectConfig = projectTrusted ? readJsonConfig(projectPath, true) : {};
-  return mergeConfigLayers(DEFAULT_CONFIG, globalConfig, projectConfig);
+  return sessionPolicy(cwd, projectTrusted).config;
 }
 
-function writeConfigFile(configPath: string, config: SandboxConfigFile): void {
+// The global file is the user-managed trust anchor. Hash and parse the same
+// bytes so a changed project file never becomes policy via a second read.
+function optionalBytes(path: string) {
+  return lstatSync(path, { throwIfNoEntry: false }) ? readFileSync(path) : undefined;
+}
+function digest(bytes: Buffer | undefined) {
+  return bytes && createHash("sha256").update(bytes).digest("hex");
+}
+export function configRevision(path: string) {
+  const entry = lstatSync(path, { throwIfNoEntry: false });
+  if (entry && (!entry.isFile() || entry.nlink !== 1))
+    throw new Error("Review linked configuration manually.");
+  return digest(optionalBytes(path));
+}
+export function sessionPolicy(cwd: string, trusted: boolean) {
+  const { globalPath, projectPath } = getConfigPaths(cwd);
+  const revisions = new Map<string, string | undefined>();
+  const bytes = optionalBytes(globalPath);
+  revisions.set(globalPath, digest(bytes));
+  const global = bytes ? parseConfig(globalPath, bytes.toString("utf8")) : {};
+  const pins = global.approvedProjectFiles ?? {};
+  if (!pins || typeof pins !== "object" || Array.isArray(pins))
+    throw new Error("Invalid approvedProjectFiles.");
+  const approved = (path: string, onlyShell = false) => {
+    if (!trusted) return {};
+    const bytes = optionalBytes(path);
+    const revision = digest(bytes);
+    revisions.set(path, revision);
+    if (!bytes && !Object.hasOwn(pins, path)) return {};
+    if (!bytes) throw new Error("Missing approved project file: " + path);
+    const parsed = parseConfig(path, bytes.toString("utf8"));
+    if (
+      onlyShell &&
+      !("shellPath" in parsed || "shellCommandPrefix" in parsed) &&
+      !Object.hasOwn(pins, path)
+    )
+      return {};
+    if (pins[path] !== revision)
+      throw new Error(
+        "Review the project configuration and pin its SHA-256 in global approvedProjectFiles: " +
+          path,
+      );
+    return parsed;
+  };
+  const project = approved(projectPath);
+  for (const layer of [global, project]) {
+    if (
+      layer.filesystem !== undefined &&
+      (!layer.filesystem || typeof layer.filesystem !== "object" || Array.isArray(layer.filesystem))
+    )
+      throw new Error("Invalid filesystem policy.");
+    for (const key of ["allowRead", "allowWrite", "denyRead", "denyWrite"] as const)
+      if (
+        layer.filesystem &&
+        Object.hasOwn(layer.filesystem, key) &&
+        (!stringArray(layer.filesystem[key]) ||
+          layer.filesystem[key]?.some((p) => !p.trim() || p.includes("\0")))
+      )
+        throw new Error("Invalid filesystem rule: " + key);
+    if (layer.enabled !== undefined && typeof layer.enabled !== "boolean")
+      throw new Error("Invalid sandbox enabled setting.");
+  }
+  const config = mergeConfigLayers(DEFAULT_CONFIG, global, project);
+  if (Object.hasOwn(global, "filePermissionProvider") && !config.filePermissionProvider)
+    config.filePermissionProvider = "";
+  const shell = approved(join(dirname(projectPath), "settings.json"), true) as {
+    shellPath?: string;
+    shellCommandPrefix?: string;
+  };
+  for (const v of [shell.shellPath, shell.shellCommandPrefix])
+    if (v !== undefined && typeof v !== "string") throw new Error("Invalid project shell setting.");
+  return { config, revisions, globalDisabled: global.enabled === false, shell };
+}
+
+export const grantKeys = {
+  domain: "allowedDomains",
+  read: "allowRead",
+  write: "allowWrite",
+} as const;
+export type GrantKind = keyof typeof grantKeys;
+
+export function addGrantToConfig(configPath: string, kind: GrantKind, value: string) {
+  const config = readConfigForWrite(configPath);
+  function append(values: string[] | undefined) {
+    const entries = stringArray(values) ?? [];
+    return entries.includes(value) ? undefined : [...entries, value];
+  }
+  if (kind === "domain") {
+    const allowedDomains = append(config.network?.allowedDomains);
+    if (!allowedDomains) return;
+    config.network = { ...config.network, allowedDomains };
+  } else {
+    const key = grantKeys[kind];
+    const values = append(config.filesystem?.[key]);
+    if (!values) return;
+    config.filesystem = { ...config.filesystem, [key]: values };
+  }
   mkdirSync(dirname(configPath), { recursive: true });
   writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
-}
-
-export function addDomainToConfig(configPath: string, domain: string): void {
-  const config = readConfigForWrite(configPath);
-  const existing = stringArray(config.network?.allowedDomains) ?? [];
-  if (existing.includes(domain)) return;
-
-  config.network = {
-    ...config.network,
-    allowedDomains: [...existing, domain],
-  };
-  writeConfigFile(configPath, config);
-}
-
-export function addReadPathToConfig(configPath: string, pathToAdd: string): void {
-  const config = readConfigForWrite(configPath);
-  const existing = stringArray(config.filesystem?.allowRead) ?? [];
-  if (existing.includes(pathToAdd)) return;
-
-  config.filesystem = {
-    ...config.filesystem,
-    allowRead: [...existing, pathToAdd],
-  };
-  writeConfigFile(configPath, config);
-}
-
-export function addWritePathToConfig(configPath: string, pathToAdd: string): void {
-  const config = readConfigForWrite(configPath);
-  const existing = stringArray(config.filesystem?.allowWrite) ?? [];
-  if (existing.includes(pathToAdd)) return;
-
-  config.filesystem = {
-    ...config.filesystem,
-    allowWrite: [...existing, pathToAdd],
-  };
-  writeConfigFile(configPath, config);
 }

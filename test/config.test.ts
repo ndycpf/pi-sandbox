@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,9 +7,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  addDomainToConfig,
-  addReadPathToConfig,
-  addWritePathToConfig,
+  addGrantToConfig,
   stripJsonComments,
   DEFAULT_CONFIG,
   DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS,
@@ -130,7 +129,22 @@ test("loadConfig ignores project configuration when the project is untrusted", (
 
   try {
     assert.equal(loadConfig(projectDir, false).enabled, false);
+    assert.throws(() => loadConfig(projectDir, true), /pin its SHA-256/);
+    const project = join(projectDir, ".pi", "sandbox.json");
+    writeFileSync(
+      join(agentDir, "sandbox.json"),
+      JSON.stringify({
+        enabled: false,
+        approvedProjectFiles: {
+          [project]: createHash("sha256").update(readFileSync(project)).digest("hex"),
+        },
+      }),
+    );
     assert.equal(loadConfig(projectDir, true).enabled, true);
+    writeFileSync(project, "{}");
+    assert.throws(() => loadConfig(projectDir, true), /pin its SHA-256/);
+    writeFileSync(join(agentDir, "sandbox.json"), '{"filesystem":{"denyWrite":"bad"}}');
+    assert.throws(() => loadConfig(projectDir, false), /Invalid filesystem rule/);
   } finally {
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
@@ -153,7 +167,7 @@ test("permission writers parse JSONC configs and preserve other sections", () =>
     '{\n  "enabled": true, // keep me\n  "network": { "allowedDomains": ["keep.com"] }\n}\n',
   );
 
-  addWritePathToConfig(configPath, "/write");
+  addGrantToConfig(configPath, "write", "/write");
 
   const written = JSON.parse(readFileSync(configPath, "utf8"));
   assert.equal(written.enabled, true);
@@ -167,7 +181,7 @@ test("permission writers refuse to overwrite an unparseable config", () => {
   const broken = '{ "enabled": true, oops }';
   writeFileSync(configPath, broken);
 
-  assert.throws(() => addWritePathToConfig(configPath, "/write"));
+  assert.throws(() => addGrantToConfig(configPath, "write", "/write"));
   assert.equal(readFileSync(configPath, "utf8"), broken);
 });
 
@@ -175,9 +189,9 @@ test("permission writers only persist the property being changed", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-sandbox-config-"));
   const configPath = join(root, "sandbox.json");
 
-  addReadPathToConfig(configPath, "/read");
-  addWritePathToConfig(configPath, "/write");
-  addDomainToConfig(configPath, "example.com");
+  addGrantToConfig(configPath, "read", "/read");
+  addGrantToConfig(configPath, "write", "/write");
+  addGrantToConfig(configPath, "domain", "example.com");
 
   const written = JSON.parse(readFileSync(configPath, "utf8"));
   assert.deepEqual(written, {

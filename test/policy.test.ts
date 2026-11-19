@@ -8,40 +8,10 @@ import assert from "node:assert/strict";
 import {
   allowsAllDomains,
   canonicalizePath,
-  decideWritePolicy,
+  canWrite,
   domainIsAllowed,
-  extractDomainsFromCommand,
   matchesPattern,
-  resolveWritePermission,
 } from "../src/policy.ts";
-
-test("extracts and deduplicates literal HTTP domains", () => {
-  assert.deepEqual(
-    extractDomainsFromCommand("curl https://api.example.com/a http://api.example.com/b"),
-    ["api.example.com"],
-  );
-});
-
-test("extracts short, IP, userinfo and mixed-case hosts; skips expansions and single labels", () => {
-  assert.deepEqual(
-    extractDomainsFromCommand(
-      'curl https://x.com/a "https://1.2.3.4:8080/b" https://user:pw@Git.Example.ORG/c HTTPS://y.io.',
-    ),
-    ["x.com", "1.2.3.4", "git.example.org", "y.io"],
-  );
-  assert.deepEqual(
-    extractDomainsFromCommand(
-      "curl https://$HOST/a https://${HOST}/b https://a$B.com http://localhost:3000 http://[::1]/c",
-    ),
-    [],
-  );
-  assert.deepEqual(
-    extractDomainsFromCommand(
-      "curl https://a.com, https://b.com; (curl https://c.com)&& curl https://d.com|x",
-    ),
-    ["a.com", "b.com", "c.com", "d.com"],
-  );
-});
 
 test("matches exact, wildcard, and all-domain policies", () => {
   assert.equal(domainIsAllowed("github.com", ["github.com"]), true);
@@ -51,74 +21,10 @@ test("matches exact, wildcard, and all-domain policies", () => {
 });
 
 test("decides write policy from deny and allow lists", () => {
-  assert.equal(decideWritePolicy("/tmp/file", ["/tmp"], ["/tmp/file"]), "deny");
-  assert.equal(decideWritePolicy("/tmp/file", ["/tmp"], []), "allow");
-  assert.equal(decideWritePolicy("/tmp/file", ["/var"], []), "prompt");
-  assert.equal(decideWritePolicy("/tmp/file", [], []), "prompt");
-});
-
-test("resolves write permission without prompting for denied or allowed paths", async () => {
-  const calls: string[] = [];
-  const prompt = async () => {
-    calls.push("prompt");
-    return { action: "session" as const, value: "/tmp" };
-  };
-  const apply = async () => {
-    calls.push("apply");
-  };
-
-  assert.deepEqual(
-    await resolveWritePermission({
-      path: "/tmp/file",
-      allowWrite: ["/tmp"],
-      denyWrite: ["/tmp/file"],
-      prompt,
-      saveWritePermission: apply,
-    }),
-    { action: "deny" },
-  );
-  assert.deepEqual(
-    await resolveWritePermission({
-      path: "/tmp/file",
-      allowWrite: ["/tmp"],
-      denyWrite: [],
-      prompt,
-      saveWritePermission: apply,
-    }),
-    { action: "allow" },
-  );
-  assert.deepEqual(calls, []);
-});
-
-test("resolves write permission prompt choices", async () => {
-  const applied: string[] = [];
-  assert.deepEqual(
-    await resolveWritePermission({
-      path: "/tmp/file",
-      allowWrite: [],
-      denyWrite: [],
-      prompt: async () => ({ action: "abort", value: "/tmp/file" }),
-      saveWritePermission: async (choice, value) => {
-        applied.push(`${choice}:${value}`);
-      },
-    }),
-    { action: "abort", value: "/tmp/file" },
-  );
-  assert.deepEqual(applied.length, 0);
-
-  assert.deepEqual(
-    await resolveWritePermission({
-      path: "/tmp/file",
-      allowWrite: [],
-      denyWrite: [],
-      prompt: async () => ({ action: "session", value: "/tmp" }),
-      saveWritePermission: async (choice, value) => {
-        applied.push(`${choice}:${value}`);
-      },
-    }),
-    { action: "granted", value: "/tmp" },
-  );
-  assert.deepEqual(applied, ["session:/tmp"]);
+  assert.equal(canWrite("/tmp/file", ["/tmp"], ["/tmp/file"]), false);
+  assert.equal(canWrite("/tmp/file", ["/tmp"], []), true);
+  assert.equal(canWrite("/tmp/file", ["/var"], []), false);
+  assert.equal(canWrite("/tmp/file", [], []), false);
 });
 
 test("path patterns support directory prefixes and globs", () => {
@@ -141,9 +47,9 @@ test("relative paths resolve against baseCwd, not process.cwd()", () => {
   assert.equal(matchesPattern("f.txt", ["."], project), true);
   assert.equal(matchesPattern("f.txt", ["other"], project), false);
 
-  // decideWritePolicy threads baseCwd through to the pattern match.
-  assert.equal(decideWritePolicy("f.txt", ["."], [], project), "allow");
-  assert.equal(decideWritePolicy("f.txt", [], [], project), "prompt");
+  // canWrite threads baseCwd through to the pattern match.
+  assert.equal(canWrite("f.txt", ["."], [], project), true);
+  assert.equal(canWrite("f.txt", [], [], project), false);
 });
 
 test("canonicalizes symlinks and nonexistent descendants", () => {

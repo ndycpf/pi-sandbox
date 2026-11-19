@@ -2,63 +2,17 @@ import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 
-export function decideWritePolicy(
+export function canWrite(
   path: string,
   allowWrite: string[],
   denyWrite: string[],
   baseCwd: string = process.cwd(),
 ) {
-  if (matchesPattern(path, denyWrite, baseCwd)) return "deny";
-  if (allowWrite.length === 0 || !matchesPattern(path, allowWrite, baseCwd)) return "prompt";
-  return "allow";
-}
-
-export async function resolveWritePermission({
-  path,
-  allowWrite,
-  denyWrite,
-  baseCwd,
-  prompt,
-  saveWritePermission,
-}: {
-  path: string;
-  allowWrite: string[];
-  denyWrite: string[];
-  baseCwd?: string;
-  prompt: (path: string) => Promise<{
-    action: "abort" | "session" | "project" | "global";
-    value: string;
-  }>;
-  saveWritePermission: (choice: "session" | "project" | "global", value: string) => Promise<void>;
-}) {
-  const policy = decideWritePolicy(path, allowWrite, denyWrite, baseCwd);
-  if (policy !== "prompt") return { action: policy };
-
-  const choice = await prompt(path);
-  if (choice.action === "abort") return { action: "abort", value: choice.value };
-
-  await saveWritePermission(choice.action, choice.value);
-  return { action: "granted", value: choice.value };
-}
-
-/**
- * Extract hosts from literal http(s) URLs in a command, skipping userinfo
- * (`user:pass@`) and lowercasing. Hosts built from shell expansions
- * (`https://$HOST/`), single-label names (`localhost`) and IPv6 literals are
- * skipped; the OS sandbox proxy still enforces whatever is connected to.
- */
-export function extractDomainsFromCommand(command: string): string[] {
-  // The host is the leading run of hostname characters, so trailing shell
-  // punctuation (`,` `;` `&&` `)`) ends it. A host that runs into `$`, `{`, `%`
-  // or `_` is being built by an expansion and its real value is unknown.
-  const urlRegex = /https?:\/\/(?:[^\s/?#@]*@)?([a-z0-9.-]+)(?![\w$%{.-])/gi;
-  const domains = new Set<string>();
-  let match: RegExpExecArray | null;
-  while ((match = urlRegex.exec(command)) !== null) {
-    const host = match[1]!.toLowerCase().replace(/\.+$/, "");
-    if (/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host)) domains.add(host);
-  }
-  return [...domains];
+  return (
+    !matchesPattern(path, denyWrite, baseCwd, false) &&
+    !matchesPattern(path, denyWrite, baseCwd) &&
+    matchesPattern(path, allowWrite, baseCwd)
+  );
 }
 
 export function domainMatchesPattern(domain: string, pattern: string): boolean {
@@ -110,12 +64,14 @@ export function matchesPattern(
   filePath: string,
   patterns: string[],
   baseCwd: string = process.cwd(),
+  resolveLinks = true,
 ): boolean {
-  const absolutePath = canonicalizePath(filePath, baseCwd);
+  const normalize = resolveLinks ? canonicalizePath : expandPath;
+  const absolutePath = normalize(filePath, baseCwd);
   return patterns.some((pattern) => {
     const absolutePattern = pattern.includes("*")
       ? expandPath(pattern, baseCwd)
-      : canonicalizePath(pattern, baseCwd);
+      : normalize(pattern, baseCwd);
     if (pattern.includes("*")) {
       const escaped = absolutePattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
       return new RegExp(`^${escaped}$`).test(absolutePath);

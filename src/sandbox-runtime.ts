@@ -8,16 +8,12 @@ import { fileURLToPath } from "node:url";
 
 import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-agent";
 
+import type { ExecutionHistory } from "./execution-history.ts";
+
 import { type SandboxConfig } from "./config.ts";
 import { canonicalizePath } from "./policy.ts";
 
 export interface SessionAllowances {
-  domains: string[];
-  readPaths: string[];
-  writePaths: string[];
-}
-
-export interface EffectiveAllowances {
   domains: string[];
   readPaths: string[];
   writePaths: string[];
@@ -75,7 +71,7 @@ function sandboxRuntimeReadPaths(platform: NodeJS.Platform): string[] {
 export function resolveAllowances(
   config: SandboxConfig,
   allowances?: SessionAllowances,
-): EffectiveAllowances {
+): SessionAllowances {
   const writePaths = unique([
     ...(config.filesystem?.allowWrite ?? []),
     ...(allowances?.writePaths ?? []),
@@ -276,67 +272,88 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
   });
 }
 
+export function killProcessGroup(child: ChildProcess): void {
+  if (!child.pid) return;
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    child.kill("SIGKILL");
+  }
+}
+
 export function createSandboxedBashOps(
   manager: ISandboxManager,
   shellPath?: string,
   sshProxy = true,
+  history?: ExecutionHistory,
+  source: "bash" | "user-bash" = "bash",
 ): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout, env }) {
-      if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
-
-      const { shell, args } = getShellConfig(shellPath);
-
-      // OpenSSH does not honor ALL_PROXY, unlike most of the tools that use
-      // the sandbox network proxy. Install a shell function so ordinary
-      // `ssh host` commands use the runtime's local SOCKS proxy too. This is
-      // deliberately opt-in at the config layer, but enabled by default.
-      const socksProxyPort = sshProxy ? manager.getSocksProxyPort() : undefined;
-      const sshProxyCommand =
-        process.platform === "darwin" && socksProxyPort !== undefined
-          ? `ssh() { /usr/bin/ssh -o 'ProxyCommand=/usr/bin/nc -X 5 -x localhost:${socksProxyPort} %h %p' "$@"; }; `
-          : "";
-      const wrappedCommand = await manager.wrapWithSandbox(`${sshProxyCommand}${command}`, shell);
-
-      const child = spawn(shell, [...args, wrappedCommand], {
-        cwd,
-        env,
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-
-      let timedOut = false;
-      let timeoutHandle: NodeJS.Timeout | undefined;
-
-      const killProcessGroup = () => {
-        if (!child.pid) return;
-        try {
-          process.kill(-child.pid, "SIGKILL");
-        } catch {
-          child.kill("SIGKILL");
-        }
-      };
-
-      if (timeout !== undefined && timeout > 0) {
-        timeoutHandle = setTimeout(() => {
-          timedOut = true;
-          killProcessGroup();
-        }, timeout * 1000);
-      }
-
-      child.stdout?.on("data", onData);
-      child.stderr?.on("data", onData);
-      signal?.addEventListener("abort", killProcessGroup, { once: true });
-
+      const trace = history?.begin(source, [command, cwd, shellPath, timeout]);
       try {
-        const exitCode = await waitForChildProcess(child);
-        if (signal?.aborted) throw new Error("aborted");
-        if (timedOut) throw new Error(`timeout:${timeout}`);
-        return { exitCode };
-      } finally {
-        if (timeoutHandle) clearTimeout(timeoutHandle);
-        signal?.removeEventListener("abort", killProcessGroup);
-        manager.cleanupAfterCommand();
+        signal?.throwIfAborted();
+        if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
+
+        const { shell } = getShellConfig(shellPath);
+        // OpenSSH does not honor ALL_PROXY, unlike most of the tools that use
+        // the sandbox network proxy. Install a shell function so ordinary
+        // `ssh host` commands use the runtime's local SOCKS proxy too. This is
+        // deliberately opt-in at the config layer, but enabled by default.
+        const socksProxyPort = sshProxy ? manager.getSocksProxyPort() : undefined;
+        const sshProxyCommand =
+          process.platform === "darwin" && socksProxyPort !== undefined
+            ? `ssh() { /usr/bin/ssh -o 'ProxyCommand=/usr/bin/nc -X 5 -x localhost:${socksProxyPort} %h %p' "$@"; }; `
+            : "";
+        const wrappedCommand = await manager.wrapWithSandbox(`${sshProxyCommand}${command}`, shell);
+
+        try {
+          signal?.throwIfAborted();
+          // The selected user shell runs inside the runtime wrapper only.
+          const launcher = process.platform === "android" ? "/system/bin/sh" : "/bin/sh";
+          const child = spawn(launcher, ["-c", wrappedCommand], {
+            cwd,
+            env,
+            detached: true,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+
+          child.once("spawn", () => trace?.spawned());
+          let timedOut = false;
+          let timeoutHandle: NodeJS.Timeout | undefined;
+
+          const kill = () => killProcessGroup(child);
+
+          if (timeout !== undefined && timeout > 0) {
+            timeoutHandle = setTimeout(() => {
+              timedOut = true;
+              kill();
+            }, timeout * 1000);
+          }
+
+          child.stdout?.on("data", onData);
+          child.stderr?.on("data", onData);
+          signal?.addEventListener("abort", kill, { once: true });
+
+          try {
+            const exitCode = await waitForChildProcess(child);
+            if (signal?.aborted) throw new Error("aborted");
+            if (timedOut) {
+              trace?.finish("timeout");
+              throw new Error(`timeout:${timeout}`);
+            }
+            trace?.finish("exited", exitCode);
+            return { exitCode };
+          } finally {
+            if (timeoutHandle) clearTimeout(timeoutHandle);
+            signal?.removeEventListener("abort", kill);
+          }
+        } finally {
+          manager.cleanupAfterCommand();
+        }
+      } catch (error) {
+        trace?.finish(signal?.aborted ? "cancelled" : "failed");
+        throw error;
       }
     },
   };

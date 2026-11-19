@@ -4,3 +4,4 @@
  */
 
 export { default } from "./src/extension.ts";
+export { registerFilePermissionProvider, type FileRequest } from "./src/file-tools.ts";

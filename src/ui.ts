@@ -21,7 +21,7 @@ import {
   getConfigPaths,
   type SandboxConfig,
 } from "./config.ts";
-import { allowsAllDomains, domainIsAllowed, matchesPattern } from "./policy.ts";
+import { allowsAllDomains } from "./policy.ts";
 import { type SessionAllowances } from "./sandbox-runtime.ts";
 
 export type PermissionChoice = "abort" | "session" | "project" | "global";
@@ -471,64 +471,11 @@ async function renderPermissionPrompt(
   }
 }
 
-const validRule = (value: string, matches: boolean, target: string): string | null => {
-  if (value.length === 0) return "Rule cannot be empty.";
-  return matches ? null : `Rule must match the blocked ${target}.`;
-};
-
-export function promptDomainBlock(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  domain: string,
-  timeoutSeconds?: number,
-): Promise<PermissionPromptResult> {
-  return showPermissionPrompt(
-    pi,
-    ctx,
-    `🌐 Network blocked: "${domain}" is not in allowedDomains`,
-    domain,
-    (value) => validRule(value, domainIsAllowed(domain, [value]), `domain "${domain}"`),
-    timeoutSeconds,
-  );
-}
-
-export function promptReadBlock(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  path: string,
-  timeoutSeconds?: number,
-): Promise<PermissionPromptResult> {
-  return showPermissionPrompt(
-    pi,
-    ctx,
-    `📖 Read blocked: "${path}" is not in allowRead`,
-    path,
-    (value) => validRule(value, matchesPattern(path, [value], ctx.cwd), `path "${path}"`),
-    timeoutSeconds,
-  );
-}
-
-export function promptWriteBlock(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  path: string,
-  timeoutSeconds?: number,
-): Promise<PermissionPromptResult> {
-  return showPermissionPrompt(
-    pi,
-    ctx,
-    `📝 Write blocked: "${path}" is not in allowWrite`,
-    path,
-    (value) => validRule(value, matchesPattern(path, [value], ctx.cwd), `path "${path}"`),
-    timeoutSeconds,
-  );
-}
-
 export function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
   if (!allowsAllDomains(config.network?.allowedDomains)) return;
   ctx.ui.notify(
     '⚠️ Network sandbox allows all domains because network.allowedDomains contains "*". ' +
-      'Only use this intentionally; remove "*" to restore per-domain prompts.',
+      'Only use this intentionally; remove "*" to restrict allowed domains.',
     "warning",
   );
 }
@@ -581,12 +528,12 @@ export function formatSandboxConfiguration(
     "Network (bash + !cmd):",
     `  Allowed domains: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
     ...(allowsAllDomains(config.network?.allowedDomains)
-      ? ['  ⚠️ "*" allows all domains and disables per-domain prompts.']
+      ? ['  ⚠️ "*" allows all domains unless explicitly denied.']
       : []),
     `  Denied domains:  ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
     ...(allowances.domains.length ? [`  Session allowed: ${allowances.domains.join(", ")}`] : []),
     "",
-    "Filesystem (bash + read/write/edit tools):",
+    "Filesystem (sandboxed shell):",
     `  Deny Read:   ${config.filesystem?.denyRead?.join(", ") || "(none)"}`,
     `  Allow Read:  ${config.filesystem?.allowRead?.join(", ") || "(none)"}`,
     `  Allow Write: ${config.filesystem?.allowWrite?.join(", ") || "(none)"}`,
@@ -596,9 +543,9 @@ export function formatSandboxConfiguration(
       ? [`  Session write: ${allowances.writePaths.join(", ")}`]
       : []),
     "",
-    "Note: ALL reads are prompted unless the path is in allowRead or allowWrite.",
+    `  Native file permission provider: ${config.filePermissionProvider ?? "bundled (default)"}`,
     "Note: allowWrite also grants read access to the same path.",
-    "Note: denyRead is not a hard-block — granting a prompt adds to allowRead, overriding denyRead.",
+    "Note: denyRead is not a hard-block — an explicit allowRead rule overrides denyRead.",
     "Note: denyWrite takes PRECEDENCE over allowWrite and is never prompted.",
   ].join("\n");
 }

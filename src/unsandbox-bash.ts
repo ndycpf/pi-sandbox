@@ -66,10 +66,10 @@ export function registerUnsandboxBash(pi: ExtensionAPI, ready: () => boolean) {
     | undefined;
 
   pi.registerTool({
-    name: "unsandbox_bash",
-    label: "Request host Bash",
+    name: "bash_with_human_approval",
+    label: "Bash with human approval",
     description:
-      "Explicitly request one host Bash command. Requires operator approval in the interactive CLI. Returns exit status only.",
+      "Ask the human operator to approve one Bash command outside the sandbox. Each call requires approval in the interactive CLI. Returns exit status only.",
     parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 4096 }) }),
     async execute(_id, { command }, abort, _update, ctx) {
       const active = session;

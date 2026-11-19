@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 
 import { registerUnsandboxBash } from "../src/unsandbox-bash.ts";
 
-test("host Bash requires one current affirmative terminal approval", async (t) => {
+test("bash_with_human_approval requires one current affirmative terminal approval", async (t) => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-approval-")));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   for (const stream of [process.stdin, process.stdout]) {
@@ -27,6 +27,7 @@ test("host Bash requires one current affirmative terminal approval", async (t) =
   const host = registerUnsandboxBash(
     {
       registerTool(def: typeof tool) {
+        assert.equal(def.name, "bash_with_human_approval");
         tool = def;
       },
     } as ExtensionAPI,

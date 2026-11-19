@@ -175,10 +175,11 @@ Saved project or global permission changes are not broadcast to other running
 sessions' sandbox managers. Restart affected sessions to apply grants or revocations
 consistently.
 
-### One-time host Bash approval
+### Bash with human approval
 
-While the sandbox is active, an agent can request `unsandbox_bash` with a single
-`command`. The interactive Linux/macOS CLI shows the shell, resolved working
+While the sandbox is active, ordinary `bash` runs inside it. An agent can call
+`bash_with_human_approval` to ask the human operator to approve one `command`
+outside the sandbox. The interactive Linux/macOS CLI shows the shell, resolved working
 directory and JSON-quoted command lines in Pi's standard selector. **Deny**
 is selected first. **Allow once** runs the entire original command, including
 any text omitted from previews over 32 lines or 2,200 characters. Escape cancels.

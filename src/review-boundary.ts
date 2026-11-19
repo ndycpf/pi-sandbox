@@ -1,7 +1,8 @@
 import { isAbsolute } from "node:path";
 
 // Supplied in memory by the deployment's trusted provisioner. The capability
-// itself must target only one already isolated workspace incarnation.
+// must run Bash in the same isolated environment as this Pi process, bound
+// to one workspace incarnation and its independently enforced local policy.
 export interface OuterWorkspace {
   readonly identity: string;
   execute(

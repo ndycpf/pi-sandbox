@@ -5,5 +5,3 @@
 
 export { default, withOuterWorkspace } from "./src/extension.ts";
 export type { OuterWorkspace, ReviewedAction } from "./src/review-boundary.ts";
-
-export { sshWorkspace } from "./src/ssh-workspace.ts";

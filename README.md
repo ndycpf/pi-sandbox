@@ -271,26 +271,22 @@ by Mario Zechner, used under the
 [MIT License](https://github.com/badlogic/pi-mono/blob/main/LICENSE).
 
 
-### On-request Guardian and an outer workspace
+### On-request Guardian in the local workspace
 
-A `require_escalated` request is for one execution outside the ordinary Pi
-sandbox, inside an existing operator-provisioned workspace. The stock extension
-refuses it. Pi 0.80.10 exposes session identity, project trust and a local
-child-process runner, but no authenticated deployment identity or evidence
-about the runner's inherited restrictions. Neither a startup flag, a container
-marker nor WSL alone establishes that those restrictions are sufficient.
+An operator running Pi inside an independently isolated development workspace
+can register `withOuterWorkspace(workspace)` and select that workspace with
+`--sandbox-review-workspace ID`. The provisioner supplies a native executor
+bound to the **same environment where Pi is running**. It must verify that
+workspace's identity and restrictions independently of the project, use the
+reviewed Bash argv and cwd, and honor cancellation and timeouts.
 
-An embedding provisioner may register `withOuterWorkspace(workspace)` instead
-of the default extension and select its exact identity with
-`--sandbox-review-workspace ID`. This is an integration contract. The
-provisioner must authenticate and pin one live container/VM incarnation and its
-execution policy independently of the project, and supply an execution capability
-scoped exclusively to it. Its native Bash runner must use the supplied argv and
-cwd with fixed deployment settings, check identity and directory at dispatch,
-honor cancellation/deadlines, and never redirect or retry on a host. Do not
-supply a generic local executor. The OpenSSH adapter targets a dedicated, existing Linux development VM.
-See [deployment and verification](adapters/ssh-workspace.md). No native VM
-run has been verified in this checkout.
+Within that deployment, a `bash` call with
+`sandbox_permissions: "require_escalated"` and a justification runs the exact
+reviewed action once on allow, in the same call. On a stock Pi installation
+there is no verified workspace executor. The call then returns
+`executed: false`; passing a workspace ID alone cannot enable execution.
+The existing `bash_with_human_approval` tool is available separately for a
+one-time local run confirmed in the interactive terminal.
 
 Set `--sandbox-review-prompt /absolute/operator/path/review.txt` at startup.
 Supply your own reviewer instructions in a regular UTF-8 file (1–65536 bytes)

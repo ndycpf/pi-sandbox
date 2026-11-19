@@ -175,6 +175,22 @@ Saved project or global permission changes are not broadcast to other running
 sessions' sandbox managers. Restart affected sessions to apply grants or revocations
 consistently.
 
+### One-time host Bash approval
+
+While the sandbox is active, an agent can request `unsandbox_bash` with a single
+`command`. The interactive Linux/macOS CLI shows the shell, resolved working
+directory and JSON-quoted command lines in Pi's standard selector. **Deny**
+is selected first. **Allow once** runs the entire original command, including
+any text omitted from previews over 32 lines or 2,200 characters. Escape cancels.
+RPC, print, JSON and non-TTY sessions cannot approve.
+
+The command runs once in a fresh `/bin/bash` with a system PATH and the
+operator's HOME. It has the host user's filesystem and network access. Only
+the exit status is returned. Approval and execution each have a 60-second
+limit. Changes or detached processes can outlive the command. Use a terminal
+you control with trusted Pi extensions. This action stores no approval and
+does not retry a previous call or change the session's sandbox settings.
+
 ### What is prompted vs. hard-blocked
 
 | Rule | Behaviour |

@@ -266,7 +266,11 @@ like the rest of `hostBash`, can only be turned on in the global config:
       "policyFile": "/Users/me/.pi/agent/host-review-policy.md",
       // Limit for one review, including its file checks (5-180, default 60);
       // on expiry you are prompted.
-      "timeoutSeconds": 60
+      "timeoutSeconds": 60,
+      // Review log at ~/.pi/agent/host-bash-review.log. When a file passes
+      // maxBytes (64 KiB-64 MiB, default 1 MiB) it is rotated, keeping `files`
+      // files (1-20, default 3, about 3 MiB). "enabled": false writes nothing.
+      "log": { "enabled": true, "maxBytes": 1048576, "files": 3 }
     }
   }
 }
@@ -332,7 +336,10 @@ fall back to you: the TUI on a terminal, or an RPC client when `approvalModes`
 includes `"rpc"` (fallback prompts then go to the client's dialog). The status
 bar shows `host_bash: auto-review (<model>)`, each auto-approved or denied run
 is shown as a notification (in RPC mode, sent to the client), and every review is appended to
-`~/.pi/agent/host-bash-review.log` (JSON lines, rotated to `.1` at 1 MiB).
+`~/.pi/agent/host-bash-review.log` as JSON lines. The log is bounded: past
+`maxBytes` it is renamed to `.1` (older files shift to `.2`, ...) and the oldest
+beyond `files` is deleted. Pi's own session history under
+`~/.pi/agent/sessions/` has no automatic cleanup.
 
 **What auto-review cannot catch.** The reviewer can read files, but it may not
 look, and it cannot follow everything a command touches: a harmless-looking

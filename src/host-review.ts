@@ -1,7 +1,7 @@
 import type { Message } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 
 import { completeSimple } from "@earendil-works/pi-ai/compat";
@@ -23,9 +23,46 @@ export type HostReviewConfig = {
   policyFile?: string;
   /** Limit for one review; on expiry the operator is prompted. */
   timeoutSeconds: number;
+  /** The review log: JSON lines, rotated by size, with a fixed number of files kept. */
+  log: ReviewLogConfig;
 };
 
-export const DEFAULT_HOST_REVIEW_CONFIG: HostReviewConfig = { mode: "human", timeoutSeconds: 60 };
+export type ReviewLogConfig = {
+  enabled: boolean;
+  /** Rotate the current file once it exceeds this size. */
+  maxBytes: number;
+  /** Files kept, counting the current one: log, log.1, ... log.(files-1). */
+  files: number;
+};
+
+export const DEFAULT_REVIEW_LOG_CONFIG: ReviewLogConfig = {
+  enabled: true,
+  maxBytes: 1024 * 1024,
+  files: 3,
+};
+
+export const DEFAULT_HOST_REVIEW_CONFIG: HostReviewConfig = {
+  mode: "human",
+  timeoutSeconds: 60,
+  log: DEFAULT_REVIEW_LOG_CONFIG,
+};
+
+function inRange(value: unknown, min: number, max: number, fallback: number) {
+  return Number.isInteger(value) && (value as number) >= min && (value as number) <= max
+    ? (value as number)
+    : fallback;
+}
+
+/** Validate `hostBash.review.log`; invalid values fall back to the defaults. */
+export function resolveReviewLogConfig(value: unknown): ReviewLogConfig {
+  const raw = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+  const defaults = DEFAULT_REVIEW_LOG_CONFIG;
+  return {
+    enabled: raw.enabled !== false,
+    maxBytes: inRange(raw.maxBytes, 64 * 1024, 64 * 1024 * 1024, defaults.maxBytes),
+    files: inRange(raw.files, 1, 20, defaults.files),
+  };
+}
 
 /** Validate a global `hostBash.review` entry. Anything invalid means human review. */
 export function resolveHostReviewConfig(value: unknown): HostReviewConfig {
@@ -40,8 +77,9 @@ export function resolveHostReviewConfig(value: unknown): HostReviewConfig {
     (raw.timeoutSeconds as number) <= 180
       ? (raw.timeoutSeconds as number)
       : DEFAULT_HOST_REVIEW_CONFIG.timeoutSeconds;
-  if (raw.mode !== "auto" || !model) return { ...DEFAULT_HOST_REVIEW_CONFIG, timeoutSeconds };
-  return { mode: "auto", model, ...(policyFile && { policyFile }), timeoutSeconds };
+  const log = resolveReviewLogConfig(raw.log);
+  if (raw.mode !== "auto" || !model) return { mode: "human", timeoutSeconds, log };
+  return { mode: "auto", model, ...(policyFile && { policyFile }), timeoutSeconds, log };
 }
 
 /** The planned action JSON, in the shape Codex gives its reviewer for a command. */
@@ -410,16 +448,36 @@ export function modelReviewer(ctx: ExtensionContext, target: string): Reviewer {
   };
 }
 
-const maxLogBytes = 1024 * 1024;
-
-/** Append one JSON line; rotate to `<path>.1` past 1 MiB. Failures are ignored. */
-export function appendReviewLog(path: string, entry: Record<string, unknown>) {
+/**
+ * Append one JSON line. When the file exceeds `maxBytes`, shift log -> log.1
+ * -> ... and drop the oldest, so at most `files` files (about
+ * `files * maxBytes`) are kept. Failures are ignored.
+ */
+export function appendReviewLog(
+  path: string,
+  entry: Record<string, unknown>,
+  config: ReviewLogConfig = DEFAULT_REVIEW_LOG_CONFIG,
+) {
+  if (!config.enabled) return;
   try {
     mkdirSync(dirname(path), { recursive: true });
+    let size = 0;
     try {
-      if (statSync(path).size > maxLogBytes) renameSync(path, path + ".1");
+      size = statSync(path).size;
     } catch {
       // No log yet.
+    }
+    if (size > config.maxBytes) {
+      const name = (n: number) => (n ? `${path}.${n}` : path);
+      rmSync(name(config.files - 1), { force: true });
+      for (let n = config.files - 2; n >= 0; n--) {
+        try {
+          renameSync(name(n), name(n + 1));
+        } catch {
+          // A missing generation is fine.
+        }
+      }
+      // With files: 1 the current file was removed above.
     }
     appendFileSync(path, JSON.stringify({ time: new Date().toISOString(), ...entry }) + "\n", {
       mode: 0o600,

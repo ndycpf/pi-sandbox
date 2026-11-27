@@ -33,6 +33,8 @@ import {
   alwaysAskReason,
   appendReviewLog,
   DEFAULT_HOST_REVIEW_CONFIG,
+  DEFAULT_REVIEW_LOG_CONFIG,
+  resolveReviewLogConfig,
   type HostReviewConfig,
   modelReviewer,
   parseAssessment,
@@ -46,7 +48,12 @@ import {
 } from "../src/host-review.ts";
 
 const supported = ["linux", "darwin"].includes(process.platform);
-const auto: HostReviewConfig = { mode: "auto", model: "fake/reviewer", timeoutSeconds: 30 };
+const auto: HostReviewConfig = {
+  mode: "auto",
+  model: "fake/reviewer",
+  timeoutSeconds: 30,
+  log: DEFAULT_REVIEW_LOG_CONFIG,
+};
 const input: PlannedAction = {
   tool: "host_bash",
   command: ["/bin/bash", "--noprofile", "--norc", "-c", "git status"],
@@ -79,7 +86,12 @@ test("review config defaults to human and needs an explicit model for auto", () 
       policyFile: "relative.md",
       timeoutSeconds: 1,
     }),
-    { mode: "auto", model: "openrouter/anthropic/claude", timeoutSeconds: 60 },
+    {
+      mode: "auto",
+      model: "openrouter/anthropic/claude",
+      timeoutSeconds: 60,
+      log: DEFAULT_REVIEW_LOG_CONFIG,
+    },
   );
   assert.equal(
     resolveHostReviewConfig({ mode: "auto", model: "a/b", policyFile: "/p.md" }).policyFile,
@@ -298,16 +310,40 @@ test("transcript records follow Codex's sync profile", () => {
   assert.equal(truncateText("short", 100), "short");
 });
 
-test("review log is JSONL and rotates", (t) => {
+test("review log is JSONL and keeps a bounded number of files", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "pi-review-log-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const log = join(dir, "nested", "review.log");
   appendReviewLog(log, { command: "ls", decision: "allow" });
   assert.equal(JSON.parse(readFileSync(log, "utf-8")).command, "ls");
-  writeFileSync(log, "x".repeat(1024 * 1024 + 1));
-  appendReviewLog(log, { command: "pwd" });
-  assert.ok(existsSync(log + ".1"));
-  assert.equal(JSON.parse(readFileSync(log, "utf-8")).command, "pwd");
+  // Default: 1 MiB per file, 3 files.
+  const fill = () => writeFileSync(log, "x".repeat(1024 * 1024 + 1));
+  for (const command of ["a", "b", "c", "d"]) {
+    fill();
+    appendReviewLog(log, { command });
+  }
+  assert.equal(JSON.parse(readFileSync(log, "utf-8")).command, "d");
+  assert.ok(existsSync(log + ".1") && existsSync(log + ".2"));
+  assert.equal(existsSync(log + ".3"), false);
+  // Custom size and one file: the old content is dropped.
+  const small = { enabled: true, maxBytes: 64 * 1024, files: 1 };
+  writeFileSync(log, "x".repeat(64 * 1024 + 1));
+  appendReviewLog(log, { command: "e" }, small);
+  assert.equal(JSON.parse(readFileSync(log, "utf-8")).command, "e");
+  // Disabled: nothing is written.
+  const off = join(dir, "off.log");
+  appendReviewLog(off, { command: "f" }, { ...small, enabled: false });
+  assert.equal(existsSync(off), false);
+  assert.deepEqual(resolveReviewLogConfig({ enabled: false, maxBytes: 10, files: 99 }), {
+    enabled: false,
+    maxBytes: 1024 * 1024,
+    files: 3,
+  });
+  assert.deepEqual(resolveReviewLogConfig({ maxBytes: 8 * 1024 * 1024, files: 5 }), {
+    enabled: true,
+    maxBytes: 8 * 1024 * 1024,
+    files: 5,
+  });
 });
 
 function fixture(t: TestContext, reviewer: Reviewer, mode: "tui" | "rpc" = "tui") {

@@ -326,14 +326,18 @@ export function registerHostBash(
             lifetime,
           );
           if (!current()) throw new Error(refusal);
-          appendReviewLog(logFile(), {
-            session: active.id,
-            model: review.model,
-            cwd,
-            command,
-            ...(reason && { reason }),
-            ...verdict,
-          });
+          appendReviewLog(
+            logFile(),
+            {
+              session: active.id,
+              model: review.model,
+              cwd,
+              command,
+              ...(reason && { reason }),
+              ...verdict,
+            },
+            review.log,
+          );
           if (verdict.decision === "allow") {
             approvedBy = "reviewer";
             active.denials = 0;

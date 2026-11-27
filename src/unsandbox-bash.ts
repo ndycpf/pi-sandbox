@@ -129,7 +129,8 @@ function outputText(tail: Tail | undefined) {
 
 function format(code: number | null, tail: Tail | undefined, path: string) {
   let status = "Host Bash exit status: " + (code ?? "terminated by signal");
-  if (code === 127) {
+  // With outputBytes 0 the agent sees the exit status only, so no host details.
+  if (code === 127 && tail) {
     status +=
       `\nExit status 127 usually means a program was not found on the host PATH (${path}). ` +
       "Report this to the operator: if the program is installed elsewhere, they can add its directory to PATH in the shell that starts Pi and restart Pi. " +
@@ -158,7 +159,7 @@ export function registerUnsandboxBash(
       "an unreachable daemon or socket, or missing or invalid credentials (gh, git, cloud CLIs, keychain). " +
       "Every call prompts the operator, so do not use it for work the sandbox can do. " +
       "Keep the command short and self-contained: the approval prompt must fit an 80x24 terminal, so a command over about 8 short lines is refused without prompting and must be shortened or split. " +
-      "Runs non-interactively with stdin closed, a minimal PATH and environment, and a time limit. " +
+      "Runs non-interactively with stdin closed, Pi's PATH and HOME (no other environment variables), and a time limit. " +
       "Returns the exit status and, when enabled, the tail of combined stdout/stderr.",
     promptSnippet: "Ask the operator to run one Bash command outside the sandbox",
     promptGuidelines: [

@@ -135,3 +135,9 @@ test("exit 127 explains how to fix the host PATH", { skip: !supported }, async (
   assert.ok(result.text.includes(`not found on the host PATH (${process.env.PATH})`));
   assert.match(result.text, /add its directory to PATH in the shell that starts Pi/);
 });
+
+test("outputBytes 0 keeps exit 127 to the status only", { skip: !supported }, async (t) => {
+  const { run } = fixture(t, { outputBytes: 0 });
+  const result = await run("definitely-not-a-command-xyz");
+  assert.equal(result.text, "Host Bash exit status: 127");
+});

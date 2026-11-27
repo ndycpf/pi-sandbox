@@ -201,9 +201,24 @@ test("hostBash config is global-only and validated", () => {
     DEFAULT_HOST_BASH_CONFIG,
   );
   assert.equal(resolveHostBashConfig({ timeoutSeconds: 600, outputBytes: 0 }).outputBytes, 0);
-  assert.deepEqual(resolveHostBashConfig({ extraPath: ["~/.docker/bin", "~x"] }).extraPath, [
-    join(homedir(), ".docker/bin"),
-  ]);
+  assert.deepEqual(
+    resolveHostBashConfig({
+      extraPath: [
+        "~/.docker/bin",
+        "$HOME/.orbstack/bin",
+        "${HOME}/bin",
+        "$HOME",
+        "~x",
+        "$HOMEX/bin",
+      ],
+    }).extraPath,
+    [
+      join(homedir(), ".docker/bin"),
+      join(homedir(), ".orbstack/bin"),
+      join(homedir(), "bin"),
+      homedir(),
+    ],
+  );
 });
 
 test("hostPath keeps system directories first and drops sandbox-writable entries", () => {

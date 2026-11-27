@@ -78,6 +78,12 @@ function boundedInteger(value: unknown, min: number, max: number, fallback: numb
     : fallback;
 }
 
+// A leading "~/", "$HOME/" or "${HOME}/" (or the bare variable) means the home directory.
+function expandHome(entry: string) {
+  const match = /^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/.exec(entry);
+  return match ? join(homedir(), entry.slice(match[0].length)) : entry;
+}
+
 /** Validate a global `hostBash` entry, dropping invalid values. */
 export function resolveHostBashConfig(value: unknown): HostBashConfig {
   const raw = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
@@ -87,7 +93,7 @@ export function resolveHostBashConfig(value: unknown): HostBashConfig {
     extraPath: [
       ...new Set(
         (stringArray(raw.extraPath) ?? [])
-          .map((entry) => (entry.startsWith("~/") ? join(homedir(), entry.slice(2)) : entry))
+          .map(expandHome)
           .filter(
             (entry) => entry.startsWith("/") && !entry.includes(":") && !entry.includes("\0"),
           ),

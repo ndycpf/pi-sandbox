@@ -229,6 +229,72 @@ will pick up from there, for example:
 
 Use a terminal you control with trusted Pi extensions.
 
+#### Auto-review (optional)
+
+With auto-review on, an LLM reviewer looks at each `host_bash` call first, so
+routine host commands do not need a prompt every time. It is off by default and,
+like the rest of `hostBash`, can only be turned on in the global config:
+
+```jsonc
+{
+  "hostBash": {
+    "enabled": true,
+    "review": {
+      // "human" (default) prompts for every call. "auto" asks the reviewer first.
+      "mode": "auto",
+      // Any model Pi can use, as "provider/model-id". Required for "auto";
+      // without it every call is prompted. Pi's own credentials are used.
+      "model": "anthropic/claude-haiku-4-5",
+      // Optional: absolute path to extra policy text appended to the built-in one.
+      "policyFile": "/Users/me/.pi/agent/host-review-policy.md",
+      // Limit for one review (5-120, default 30); on expiry you are prompted.
+      "timeoutSeconds": 30
+    }
+  }
+}
+```
+
+The reviewer gets the command, resolved working directory, shell, inherited
+`PATH`, time limit, how much output the agent will see, the agent's one-line
+`reason` and your latest message in the session. It is told that all of these
+are data, not instructions, and to treat workspace scripts, package scripts,
+git hooks and programs on a workspace `PATH` entry as code it cannot see. It
+answers `allow`, `deny` or `ask`:
+
+- **allow** runs the command without a prompt. It is the only answer that does,
+  and an `allow` the reviewer itself rates `high` or `critical` risk counts as `ask`.
+- **ask**, an error, a timeout, a missing model or credentials, or any answer
+  that is not exactly the expected JSON shows you the normal prompt.
+- **deny** returns the reviewer's reason to the agent without prompting you.
+  After 3 denials in a row, auto-review pauses for the rest of the session and
+  every call is prompted.
+
+Some commands always come to you whatever the reviewer would say: `sudo` and
+similar, `rm` with `-r` or `-f`, piping into a shell, disk-level tools, paths
+or commands that look like credentials (`~/.ssh`, `~/.aws`, keychain,
+`gh auth token`, ...), and `eval`/`exec`/base64-decoding. This list is a speed
+bump, not a boundary; it is easy to spell the same action another way.
+
+All existing guards still apply: the 80x24 size limit (an oversized command is
+refused before review), the working-directory re-check, the time limit and the
+output cap. Auto-review needs the same interactive TUI session as manual
+approval, because it can fall back to you. The status bar shows
+`host_bash: auto-review (<model>)`, each auto-approved run is shown as a
+notification, and every review is appended to
+`~/.pi/agent/host-bash-review.log` (JSON lines, rotated to `.1` at 1 MiB).
+
+**What auto-review cannot catch.** The reviewer sees text, not the machine. It
+cannot see the contents of files a command runs or reads, so a harmless-looking
+`make test` or `git commit` can run code the agent wrote earlier in the
+workspace (it is told to answer `ask` for these, but it may not). Text in the
+command, the agent's reason or your pasted messages can try to talk it into
+`allow` (prompt injection). It can misjudge what a command does, especially an
+unusual or obfuscated one. Commands it allows run with your full user rights,
+and each review sends the command, working directory, `PATH` and your latest
+message to the model provider you configured. Use auto-review for convenience
+on a machine and model you trust, not as a security boundary; keep `mode:
+"human"` where a wrong `allow` would be costly.
+
 ### What is prompted vs. hard-blocked
 
 | Rule | Behaviour |

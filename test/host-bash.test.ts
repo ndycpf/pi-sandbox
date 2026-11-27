@@ -102,7 +102,7 @@ test("host_bash requires one current affirmative terminal approval", async (t) =
   assert.deepEqual(choices, ["Deny", "Allow once"]);
   assert.match(title, /limit 60s, agent sees last 16384 bytes of output/);
   choose("Allow once");
-  assert.deepEqual((await pending).details, { exitCode: 0 });
+  assert.deepEqual((await pending).details, { exitCode: 0, approvedBy: "operator" });
   assert.equal(launch.mock.callCount(), 1);
 
   const abort = new AbortController();
@@ -193,7 +193,21 @@ test("hostBash config is global-only and validated", () => {
     { hostBash: { enabled: true } },
     { hostBash: { enabled: false, timeoutSeconds: 3000 } },
   );
-  assert.deepEqual(merged.hostBash, { enabled: true, timeoutSeconds: 60, outputBytes: 16384 });
+  assert.deepEqual(merged.hostBash, {
+    enabled: true,
+    timeoutSeconds: 60,
+    outputBytes: 16384,
+    review: { mode: "human", timeoutSeconds: 30 },
+  });
+  // A project file cannot turn on auto-review either.
+  assert.equal(
+    mergeConfigLayers(
+      DEFAULT_CONFIG,
+      { hostBash: { enabled: true } },
+      { hostBash: { review: { mode: "auto", model: "x/y" } } },
+    ).hostBash?.review?.mode,
+    "human",
+  );
   assert.equal(
     mergeConfigLayers(DEFAULT_CONFIG, {}, { hostBash: { enabled: true } }).hostBash?.enabled,
     false,

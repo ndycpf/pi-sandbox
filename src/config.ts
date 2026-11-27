@@ -4,6 +4,12 @@ import { dirname, join } from "node:path";
 import { type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
+import {
+  DEFAULT_HOST_REVIEW_CONFIG,
+  type HostReviewConfig,
+  resolveHostReviewConfig,
+} from "./host-review.ts";
+
 export type SandboxConfig = Omit<SandboxRuntimeConfig, "network" | "filesystem"> & {
   /**
    * `denyMandatoryCwdFiles` is added to @carderne/sandbox-runtime by PR #21.
@@ -21,7 +27,7 @@ export type SandboxConfig = Omit<SandboxRuntimeConfig, "network" | "filesystem">
   enableAccessRequestTool?: boolean;
   permissionPromptTimeoutSeconds?: number;
   /** Operator-approved host Bash tool. Global-only; project values are ignored. */
-  hostBash?: Partial<HostBashConfig>;
+  hostBash?: Partial<Omit<HostBashConfig, "review">> & { review?: Partial<HostReviewConfig> };
   network?: NonNullable<SandboxRuntimeConfig["network"]> & {
     allowUnauthenticatedSocksProxy?: boolean;
     /** Route ordinary `ssh` commands through the sandbox SOCKS proxy. */
@@ -60,12 +66,15 @@ export type HostBashConfig = {
   timeoutSeconds: number;
   /** Bytes of combined stdout/stderr tail returned to the agent; 0 returns exit status only. */
   outputBytes: number;
+  /** Who approves a call: the operator only, or an LLM reviewer first. */
+  review: HostReviewConfig;
 };
 
 export const DEFAULT_HOST_BASH_CONFIG: HostBashConfig = {
   enabled: false,
   timeoutSeconds: 60,
   outputBytes: 16 * 1024,
+  review: DEFAULT_HOST_REVIEW_CONFIG,
 };
 
 function boundedInteger(value: unknown, min: number, max: number, fallback: number) {
@@ -82,6 +91,7 @@ export function resolveHostBashConfig(value: unknown): HostBashConfig {
     enabled: raw.enabled === true,
     timeoutSeconds: boundedInteger(raw.timeoutSeconds, 1, 3600, defaults.timeoutSeconds),
     outputBytes: boundedInteger(raw.outputBytes, 0, 64 * 1024, defaults.outputBytes),
+    review: resolveHostReviewConfig(raw.review),
   };
 }
 

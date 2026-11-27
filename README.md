@@ -271,7 +271,11 @@ like the rest of `hostBash`, can only be turned on in the global config:
       // Review log at ~/.pi/agent/host-bash-review.log. When a file passes
       // maxBytes (64 KiB-64 MiB, default 1 MiB) it is rotated, keeping `files`
       // files (1-20, default 3, about 3 MiB). "enabled": false writes nothing.
-      "log": { "enabled": true, "maxBytes": 1048576, "files": 3 }
+      "log": { "enabled": true, "maxBytes": 1048576, "files": 3 },
+      // Optional: absolute paths of the programs the reviewer's read and ls
+      // run. By default the first that exists of /bin/sh or /usr/bin/sh,
+      // /usr/bin/head or /bin/head, /bin/ls or /usr/bin/ls (macOS and Linux).
+      "binaries": { "sh": "/bin/sh", "head": "/usr/bin/head", "ls": "/bin/ls" }
     }
   }
 }
@@ -296,18 +300,24 @@ in Codex's extra-policy slot. Its user message has:
 
 Like Codex's reviewer, it can check local state before deciding, but only with
 two read-only tools: `read` (up to 16 KiB of a text file, with a line offset)
-and `ls` (up to 200 entries). As in Codex, they run in the agent's sandbox
-(`head -c` and `ls`), with writes denied and no network, so they see exactly
-what sandboxed commands see: `denyRead`/`allowRead` and `credentials.files`
-apply as usual, and a denied path fails or looks empty. On top of that, the
-reviewer never reads secret files even where the sandbox could, because what it
-reads is sent to the model provider: `/proc`, `/sys`, `/dev`,
-`~/.pi/agent/auth.json`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`,
-`~/.docker`, `~/.config/gh`, `~/.config/gcloud`, keychains, `.env*`,
-`*.pem`/`*.key` and similar, `id_*`, `.netrc`, `.npmrc`, credentials files.
-That list is a path check after resolving symlinks, not a sandbox rule, so a
-symlink swapped between the check and the read can get past it; the sandbox's
-own rules still hold. A review gets at most 8 tool calls and 64 KiB of tool
+and `ls` (up to 200 entries). As in Codex, they run in a sandbox: `head -c`
+and `ls`, by absolute path with a fixed `PATH`, so nothing in the agent's
+`PATH` stands in for them. Writes are denied, and the reviewer's sandbox has a
+network proxy of its own that allows no host, whatever the session allows.
+Reads follow the session's `denyRead`/`allowRead` and `credentials.files`, so
+a denied path fails or looks empty. On top of that, the reviewer never reads
+secret files even where the sandbox could, because what it reads is sent to
+the model provider: `/proc`, `/sys`, `/dev`, `~/.pi/agent/auth.json`,
+`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.config/gh`,
+`~/.config/gcloud`, keychains, `.env*`, `*.pem`/`*.key` and similar, `id_*`,
+`.netrc`, `.npmrc`, credentials files. Each path is checked after resolving
+symlinks, and the sandbox also denies the listed directories and the
+secret-named files under the working directory, so a symlink swapped after
+the check still cannot reach them. Two gaps remain: secret-named files outside
+the working directory and those directories are refused by the path check
+only, and the sandbox mounts `/proc`, `/sys` and `/dev` itself (there the
+reviewer sees only its own process, whose environment holds just `PATH`,
+`HOME` and the proxy settings). A review gets at most 8 tool calls and 64 KiB of tool
 output. The prompt tells it to look only when the result could change its
 decision (for example the target of an `rm -rf` or a script a command runs) and
 that what it reads is untrusted evidence. Its checks are listed in the review
@@ -329,7 +339,7 @@ It answers with Codex's JSON contract (`outcome` `allow`/`deny`, `risk_level`,
   the rest of the session and every call is prompted.
 
 Auto-review is turned on and off only in the global config; restart Pi after
-changing it. An `"auto"` config with a bad `model` or `policyFile` is not used:
+changing it. An `"auto"` config with a bad `model`, `policyFile` or `binaries` entry is not used:
 every call is prompted, and Pi shows the error at session start and
 `host_bash: human (review config error)` in the status bar.
 

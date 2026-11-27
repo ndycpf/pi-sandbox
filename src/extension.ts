@@ -25,7 +25,7 @@ import {
   resolveWritePermission,
 } from "./policy.ts";
 import {
-  createReviewExec,
+  createReviewSandbox,
   createSandboxedBashOps,
   initializeSandbox,
   updateSandboxConfig,
@@ -51,6 +51,7 @@ import {
 
 export default function (pi: ExtensionAPI) {
   const sandboxManager = createSandboxManager();
+  const reviewSandbox = createReviewSandbox(sandboxManager);
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
     type: "boolean",
@@ -170,6 +171,7 @@ export default function (pi: ExtensionAPI) {
     cancelPermissionPrompts(pi);
     if (sandboxInitialized) {
       try {
+        await reviewSandbox.reset();
         await sandboxManager.reset();
       } catch {
         // Ignore cleanup errors.
@@ -487,7 +489,7 @@ export default function (pi: ExtensionAPI) {
         // hostBash is global-only, so project trust does not change it.
         (cwd) => resolveHostBashConfig(loadConfig(cwd, false).hostBash),
         // The auto-reviewer reads through the sandbox, read-only and offline.
-        { reviewExec: createReviewExec(sandboxManager) },
+        { reviewExec: reviewSandbox.exec },
       );
     }
     if (pi.getFlag("no-sandbox") as boolean) {
@@ -509,6 +511,7 @@ export default function (pi: ExtensionAPI) {
     cancelPermissionPrompts(pi);
     if (!sandboxInitialized) return;
     try {
+      await reviewSandbox.reset();
       await sandboxManager.reset();
     } catch {
       // Ignore cleanup errors.

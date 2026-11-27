@@ -17,6 +17,7 @@ import {
   resolveHostBashConfig,
 } from "../src/config.ts";
 import { hostPath, registerHostBash, titleRows } from "../src/host-bash.ts";
+import { DEFAULT_HOST_REVIEW_CONFIG } from "../src/host-review.ts";
 
 test("host_bash requires one current affirmative terminal approval", async (t) => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-approval-")));
@@ -208,6 +209,7 @@ test("hostBash config is global-only and validated", () => {
       mode: "human",
       timeoutSeconds: 60,
       log: { enabled: true, maxBytes: 1048576, files: 3 },
+      binaries: DEFAULT_HOST_REVIEW_CONFIG.binaries,
     },
   });
   // A project file cannot turn on auto-review either.

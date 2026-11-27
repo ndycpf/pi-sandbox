@@ -1,11 +1,14 @@
-import type { ISandboxManager, SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
-
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  createSandboxManager,
+  type ISandboxManager,
+  type SandboxRuntimeConfig,
+} from "@carderne/sandbox-runtime";
 import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-agent";
 
 import type { ReviewExec } from "./host-review-tools.ts";
@@ -348,28 +351,64 @@ const REVIEW_EXEC_TIMEOUT_MS = 10_000;
 const REVIEW_EXEC_MAX_BYTES = 2 * 1024 * 1024;
 
 /**
- * Runs the auto-reviewer's read-only commands in the sandbox, with the
- * session's read rules (and credentials), no writes beyond the runtime's
- * defaults, and no network. Output is capped and the command is time-limited.
+ * Runs the auto-reviewer's read-only commands in a sandbox of their own: the
+ * session's read rules and credentials, plus the reviewer's extra denies, no
+ * writes beyond the runtime's defaults, and no network. The network part needs
+ * its own manager, because a manager's proxy allows by its session-wide
+ * allowlist whatever a single call asks for. Output is capped and each command
+ * is time-limited.
  */
-export function createReviewExec(manager: ISandboxManager): ReviewExec {
-  return async (command, cwd, signal) => {
-    const config = manager.getConfig();
+export function createReviewSandbox(
+  session: ISandboxManager,
+  create: () => ISandboxManager = createSandboxManager,
+): { exec: ReviewExec; reset(): Promise<void> } {
+  let offline: { manager: ISandboxManager; ready: Promise<void> } | undefined;
+  const start = (config: SandboxRuntimeConfig) => {
+    if (!offline) {
+      const manager = create();
+      const ready = manager.initialize({
+        ...config,
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+          allowUnixSockets: [],
+          allowLocalBinding: false,
+          strictAllowlist: true,
+        } as SandboxRuntimeConfig["network"],
+      });
+      offline = { manager, ready };
+      ready.catch(() => {
+        if (offline?.manager === manager) offline = undefined;
+      });
+    }
+    return offline;
+  };
+  const exec: ReviewExec = async ({ command, cwd, shell, denyRead }, signal) => {
+    const config = session.getConfig();
     if (!config) throw new Error("sandbox not initialized");
+    const { manager, ready } = start(config);
+    await ready;
     const wrapped = await manager.wrapWithSandbox(
       command,
-      "/bin/sh",
+      shell,
       {
-        filesystem: { ...config.filesystem, disabled: false, allowWrite: [], denyWrite: [] },
-        network: { ...config.network, allowedDomains: [] },
+        filesystem: {
+          ...config.filesystem,
+          disabled: false,
+          denyRead: [...config.filesystem.denyRead, ...denyRead],
+          allowWrite: [],
+          denyWrite: [],
+        },
+        credentials: config.credentials,
       },
       signal,
     );
     try {
       return await new Promise((resolve, reject) => {
-        const child = spawn("/bin/sh", ["-c", wrapped], {
+        const child = spawn(shell, ["-c", wrapped], {
           cwd,
-          env: { PATH: process.env.PATH, HOME: process.env.HOME },
+          // Fixed, so nothing from the agent's PATH runs in the reviewer's commands.
+          env: { PATH: "/usr/bin:/bin", HOME: process.env.HOME },
           stdio: ["ignore", "pipe", "ignore"],
           signal: AbortSignal.any([
             ...(signal ? [signal] : []),
@@ -388,5 +427,17 @@ export function createReviewExec(manager: ISandboxManager): ReviewExec {
     } finally {
       manager.cleanupAfterCommand();
     }
+  };
+  return {
+    exec,
+    async reset() {
+      const current = offline;
+      offline = undefined;
+      if (current)
+        await current.ready.then(
+          () => current.manager.reset(),
+          () => {},
+        );
+    },
   };
 }

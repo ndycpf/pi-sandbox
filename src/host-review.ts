@@ -10,7 +10,9 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { reviewInstructions, reviewRequest } from "./host-review-prompt.ts";
 import {
   maxToolCalls,
+  type ReviewBinaries,
   type ReviewExec,
+  resolveReviewBinaries,
   ReviewToolRunner,
   reviewTools,
 } from "./host-review-tools.ts";
@@ -26,6 +28,8 @@ export type HostReviewConfig = {
   timeoutSeconds: number;
   /** The review log: JSON lines, rotated by size, with a fixed number of files kept. */
   log: ReviewLogConfig;
+  /** Absolute paths of the programs the reviewer's read and ls run. */
+  binaries: ReviewBinaries;
   /** Why an "auto" config was rejected; review then stays "human". */
   error?: string;
 };
@@ -48,6 +52,7 @@ export const DEFAULT_HOST_REVIEW_CONFIG: HostReviewConfig = {
   mode: "human",
   timeoutSeconds: 60,
   log: DEFAULT_REVIEW_LOG_CONFIG,
+  binaries: resolveReviewBinaries(undefined).binaries,
 };
 
 function inRange(value: unknown, min: number, max: number, fallback: number) {
@@ -81,16 +86,17 @@ export function resolveHostReviewConfig(value: unknown): HostReviewConfig {
       ? (raw.timeoutSeconds as number)
       : DEFAULT_HOST_REVIEW_CONFIG.timeoutSeconds;
   const log = resolveReviewLogConfig(raw.log);
-  if (raw.mode !== "auto") return { mode: "human", timeoutSeconds, log };
+  const { binaries, error: binariesError } = resolveReviewBinaries(raw.binaries);
+  if (raw.mode !== "auto") return { mode: "human", timeoutSeconds, log, binaries };
   // An "auto" config the operator got wrong must not run with less than they
   // configured: it falls back to human review and says why.
   const error = !model
     ? 'hostBash.review.model must be "provider/model-id"'
     : raw.policyFile !== undefined && !(policyFile && isAbsolute(policyFile))
       ? "hostBash.review.policyFile must be an absolute path or start with ~/"
-      : undefined;
-  if (error) return { mode: "human", timeoutSeconds, log, error };
-  return { mode: "auto", model, ...(policyFile && { policyFile }), timeoutSeconds, log };
+      : binariesError;
+  if (error) return { mode: "human", timeoutSeconds, log, binaries, error };
+  return { mode: "auto", model, ...(policyFile && { policyFile }), timeoutSeconds, log, binaries };
 }
 
 /** The planned action JSON, in the shape Codex gives its reviewer for a command. */
@@ -366,7 +372,7 @@ export async function reviewCommand(
     signal.addEventListener("abort", stop, { once: true });
   });
   aborted.catch(() => {});
-  const tools = new ReviewToolRunner(action.cwd, exec);
+  const tools = new ReviewToolRunner(action.cwd, exec, config.binaries);
   const checks = () => (tools.history.length ? { checks: tools.history } : {});
   try {
     const system = reviewSystemPrompt(config);

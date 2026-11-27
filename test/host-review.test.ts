@@ -29,7 +29,13 @@ import {
   REJECTION_INSTRUCTIONS,
   reviewInstructions,
 } from "../src/host-review-prompt.ts";
-import { isSecretPath, type ReviewExec, ReviewToolRunner } from "../src/host-review-tools.ts";
+import {
+  isSecretPath,
+  resolveReviewBinaries,
+  type ReviewExec,
+  type ReviewRequest,
+  ReviewToolRunner,
+} from "../src/host-review-tools.ts";
 import {
   alwaysAskReason,
   appendReviewLog,
@@ -54,7 +60,9 @@ const auto: HostReviewConfig = {
   model: "fake/reviewer",
   timeoutSeconds: 30,
   log: DEFAULT_REVIEW_LOG_CONFIG,
+  binaries: DEFAULT_HOST_REVIEW_CONFIG.binaries,
 };
+const bins = DEFAULT_HOST_REVIEW_CONFIG.binaries;
 const input: PlannedAction = {
   tool: "host_bash",
   command: ["/bin/bash", "--noprofile", "--norc", "-c", "git status"],
@@ -66,7 +74,7 @@ const input: PlannedAction = {
   output_to_agent: "agent sees last 16384 bytes of output",
 };
 // Stands in for the sandbox in these tests: plain sh, no isolation.
-const exec: ReviewExec = (command, cwd) =>
+const exec: ReviewExec = ({ command, cwd }) =>
   new Promise((resolve, reject) =>
     execFile("/bin/sh", ["-c", command], { cwd, encoding: "buffer" }, (error, stdout) => {
       const code = (error as { code?: unknown } | null)?.code;
@@ -99,6 +107,7 @@ test("review config defaults to human and needs an explicit model for auto", () 
       model: "openrouter/anthropic/claude",
       timeoutSeconds: 60,
       log: DEFAULT_REVIEW_LOG_CONFIG,
+      binaries: bins,
     },
   );
   // A policy file the operator set but that cannot be used turns auto off, with a reason.
@@ -554,23 +563,31 @@ test("reviewer read and ls run as shell commands, minus secrets", async (t) => {
   assert.equal(isSecretPath("link", work), true);
   assert.equal(isSecretPath("/proc/self/environ", work), true);
 
-  const commands: string[] = [];
-  const tools = new ReviewToolRunner(work, (command, cwd) => {
-    commands.push(command);
-    return exec(command, cwd);
-  });
+  const requests: ReviewRequest[] = [];
+  const tools = new ReviewToolRunner(
+    work,
+    (request) => {
+      requests.push(request);
+      return exec(request);
+    },
+    bins,
+  );
   assert.deepEqual(await tools.run("read", { path: "build.sh" }), {
     text: "echo build\n",
     isError: false,
   });
-  assert.match(commands[0]!, /exec head -c \d+ -- '\/.*\/build\.sh'$/);
+  // Programs by absolute path, and secret files denied by the sandbox too.
+  assert.match(requests[0]!.command, /exec '\/[^']*\/head' -c \d+ -- '\/.*\/build\.sh'$/);
+  assert.equal(requests[0]!.shell, bins.sh);
+  assert.ok(requests[0]!.denyRead.includes(join(work, ".env")));
+  assert.ok(requests[0]!.denyRead.includes(join(homedir(), ".ssh")));
   assert.equal((await tools.run("read", { path: "it's" })).text, "quoted\n");
   // Secret paths never reach the sandbox.
   assert.deepEqual(await tools.run("read", { path: "link" }), {
     text: "Refused: secret file.",
     isError: true,
   });
-  assert.equal(commands.length, 2);
+  assert.equal(requests.length, 2);
   const listing = await tools.run("ls", { path: "." });
   assert.equal(listing.isError, false);
   assert.deepEqual(listing.text.split("\n").sort(), [".env", "build.sh", "it's", "link", "sub/"]);
@@ -584,7 +601,7 @@ test("reviewer read and ls run as shell commands, minus secrets", async (t) => {
   assert.deepEqual(tools.history[0], { tool: "read", path: "build.sh", ok: true });
 
   // Long files are capped, and offset skips lines.
-  const more = new ReviewToolRunner(work, exec);
+  const more = new ReviewToolRunner(work, exec, bins);
   writeFileSync(join(work, "big"), Array.from({ length: 5000 }, (_, i) => `line ${i}`).join("\n"));
   const big = (await more.run("read", { path: "big" })).text;
   assert.ok(Buffer.byteLength(big) < 17 * 1024);
@@ -595,14 +612,23 @@ test("reviewer read and ls run as shell commands, minus secrets", async (t) => {
   writeFileSync(join(work, "bin"), Buffer.from([1, 0, 2]));
   assert.equal((await more.run("read", { path: "bin" })).text, "Binary file.");
   // A failing command, or no sandbox at all, is an error, not evidence.
-  const denied = new ReviewToolRunner(work, async () => ({ stdout: Buffer.from(""), exitCode: 1 }));
+  const denied = new ReviewToolRunner(
+    work,
+    async () => ({ stdout: Buffer.from(""), exitCode: 1 }),
+    bins,
+  );
   assert.deepEqual(await denied.run("read", { path: "build.sh" }), {
     text: "Failed: not readable in the sandbox.",
     isError: true,
   });
   assert.equal(
-    (await new ReviewToolRunner(work, undefined).run("ls", { path: "." })).text,
+    (await new ReviewToolRunner(work, undefined, bins).run("ls", { path: "." })).text,
     "Failed: no sandbox to read with.",
+  );
+  assert.equal(
+    (await new ReviewToolRunner(work, exec, { ...bins, ls: undefined }).run("ls", { path: "." }))
+      .text,
+    "Failed: no ls found; set hostBash.review.binaries.ls.",
   );
   // The call budget is 8.
   while (more.calls < 8) await more.run("ls", { path: "." });
@@ -610,6 +636,15 @@ test("reviewer read and ls run as shell commands, minus secrets", async (t) => {
     text: "Tool budget exhausted. Give your final answer now.",
     isError: true,
   });
+});
+
+test("reviewer binaries default to the usual paths and can be set", () => {
+  const { binaries } = resolveReviewBinaries(undefined);
+  for (const path of Object.values(binaries)) assert.ok(path && existsSync(path));
+  assert.equal(resolveReviewBinaries({ head: "/opt/bin/head" }).binaries.head, "/opt/bin/head");
+  const review = resolveHostReviewConfig({ mode: "auto", model: "a/b", binaries: { ls: "ls" } });
+  assert.equal(review.mode, "human");
+  assert.equal(review.error, "hostBash.review.binaries.ls must be an absolute path");
 });
 
 test("modelReviewer runs read and ls calls before the answer", async (t) => {

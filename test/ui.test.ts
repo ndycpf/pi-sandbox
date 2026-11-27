@@ -147,8 +147,6 @@ function dialogRig(signal?: AbortSignal) {
         opened.resolve();
         opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
       }),
-    // Saving a persistent rule asks for a second confirmation; approve it here.
-    confirm: async () => true,
   };
   const ctx = {
     cwd: "/workspace",
@@ -178,8 +176,7 @@ test(
       const rig = dialogRig();
       const prompt = showPermissionPrompt(pi, rig.ctx, "Blocked", "example.test", () => null, 30);
       await rig.opened;
-      const timeout = rig.selects[0]?.timeout;
-      assert.ok(timeout !== undefined && timeout <= 30_000 && timeout > 29_000);
+      assert.equal(rig.selects[0]?.timeout, 30_000);
       assert.equal(rig.selects[0]?.options.length, 4);
       const label =
         answer === undefined

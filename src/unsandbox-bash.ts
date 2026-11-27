@@ -28,27 +28,8 @@ function quoted(value: string) {
 
 class ApprovalRefused extends Error {}
 
-// Title compaction adapted from MasuRii/pi-permission-system, src/permission-dialog.ts (MIT).
-// A compacted prompt hides part of the command, so it offers Deny only.
-function compactTitle(title: string): { title: string; compacted: boolean } {
-  const lines = title.split("\n");
-  if (lines.length <= 32 && title.length <= 2200) return { title, compacted: false };
-
-  const prefixLines = lines.slice(0, 31);
-  const omittedLines = lines.length - prefixLines.length;
-  let prefix = prefixLines.join("\n").trimEnd();
-  // The size of the notice depends on how many characters it replaces.
-  for (;;) {
-    const omitted = title.length - prefix.length;
-    const counts = [];
-    if (omittedLines) counts.push(`${omittedLines} ${omittedLines === 1 ? "line" : "lines"}`);
-    counts.push(`${omitted} ${omitted === 1 ? "character" : "characters"}`);
-    const notice = `[Permission prompt compacted: omitted ${counts.join(" and ")} to keep the permission dialog usable. Allow once is unavailable because the command is not fully shown.]`;
-    const budget = 2200 - notice.length - 1;
-    if (prefix.length <= budget) return { title: prefix + "\n" + notice, compacted: true };
-    prefix = prefix.slice(0, budget).trimEnd();
-  }
-}
+const maxPromptLines = 32;
+const maxPromptChars = 2200;
 
 async function approve(
   ctx: ExtensionContext,
@@ -61,19 +42,32 @@ async function approve(
   const output = options.outputBytes
     ? `last ${options.outputBytes} bytes of stdout/stderr are returned to the agent`
     : "only the exit status is returned to the agent";
-  const { title, compacted } = compactTitle(
-    [
-      "Run outside the OS sandbox?",
-      "Host files and network are accessible. Changes can persist.",
-      `Limit: ${options.timeoutSeconds}s; ${output}.`,
-      "Shell: " + shell,
-      "PATH (JSON): " + quoted(path),
-      "CWD (JSON): " + quoted(cwd),
-      "Command (JSON-quoted lines): " + command.split("\n").map(quoted).join("\n"),
-    ].join("\n"),
-  );
-  const choices = compacted ? ["Deny"] : ["Deny", "Allow once"];
-  const choice = await ctx.ui.select(title, choices, { signal });
+  const header = [
+    "Run outside the OS sandbox?",
+    "Host files and network are accessible. Changes can persist.",
+    `Limit: ${options.timeoutSeconds}s; ${output}.`,
+    "Shell: " + shell,
+    "PATH (JSON): " + quoted(path),
+    "CWD (JSON): " + quoted(cwd),
+  ];
+  const shown = command.split("\n").map(quoted);
+  const title = [...header, "Command (JSON-quoted lines): " + shown.join("\n")].join("\n");
+  const lines = title.split("\n").length;
+  // The operator must be able to read the whole command, so an oversized one
+  // goes back to the agent instead of reaching the operator.
+  if (lines > maxPromptLines || title.length > maxPromptChars) {
+    const commandLines = maxPromptLines - header.length;
+    const commandChars = maxPromptChars - (title.length - shown.join("\n").length);
+    throw new ApprovalRefused(
+      `Host command refused before prompting: command too long. ` +
+        `As shown to the operator it is ${shown.length} lines and ${shown.join("\n").length} characters (JSON-quoted); ` +
+        `the limit for this call is ${commandLines} lines and ${commandChars} characters, so the operator could not read all of it. ` +
+        "Shorten the command and call again: split it into several bash_with_human_approval calls, " +
+        "remove comments and blank lines, or run the parts that do not need the host in ordinary sandboxed bash. " +
+        "Do not move the logic into a script file to shorten it; the operator cannot review a file's contents in the prompt.",
+    );
+  }
+  const choice = await ctx.ui.select(title, ["Deny", "Allow once"], { signal });
   if (signal.aborted || choice === undefined) {
     throw new ApprovalRefused(
       signal.reason?.name === "TimeoutError"
@@ -81,7 +75,7 @@ async function approve(
         : "Host command refused: approval cancelled.",
     );
   }
-  return !compacted && choice === "Allow once";
+  return choice === "Allow once";
 }
 
 function within(parent: string, child: string) {
@@ -162,7 +156,7 @@ export function registerUnsandboxBash(
       "Typical signs: 'Operation not permitted', 'Permission denied' outside the workspace, blocked network, 'command not found' for a tool installed on the host (docker, brew, gcloud), " +
       "an unreachable daemon or socket, or missing or invalid credentials (gh, git, cloud CLIs, keychain). " +
       "Every call prompts the operator, so do not use it for work the sandbox can do. " +
-      "Keep the command short and self-contained: if it does not fit the prompt in full (about 25 lines), it is refused. " +
+      "Keep the command short and self-contained: a command over about 25 lines or 2,000 characters is refused without prompting and must be shortened or split. " +
       "Runs non-interactively with stdin closed, a minimal PATH and environment, and a time limit. " +
       "Returns the exit status and, when enabled, the tail of combined stdout/stderr.",
     promptSnippet: "Ask the operator to run one Bash command outside the sandbox",

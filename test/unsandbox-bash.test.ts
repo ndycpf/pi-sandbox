@@ -125,22 +125,24 @@ test("bash_with_human_approval requires one current affirmative terminal approva
   expired.abort(new DOMException("Timeout", "TimeoutError"));
   await assert.rejects(pending, /approval timed out/);
   timeout.mock.restore();
-  const multiline = Array.from({ length: 32 }, (_, i) => `# line ${i}`).join("\n");
-  pending = run(undefined, multiline);
-  assert.equal(title.split("\n").length, 32);
-  assert.match(title, /compacted: omitted 7 lines and/);
-  assert.deepEqual(choices, ["Deny"]);
+  // Oversized commands go back to the agent without prompting the operator.
+  const before = prompts;
+  const multiline = Array.from({ length: 27 }, (_, i) => `# line ${i}`).join("\n");
+  await assert.rejects(
+    run(undefined, multiline),
+    /refused before prompting: command too long\. As shown to the operator it is 27 lines .* the limit for this call is 26 lines/,
+  );
+  await assert.rejects(
+    run(undefined, "# " + "x".repeat(2500)),
+    /command too long.*Shorten the command/,
+  );
+  assert.equal(prompts, before);
+  // The largest command that fits is still prompted in full.
+  const fits = Array.from({ length: 26 }, (_, i) => `# line ${i}`).join("\n");
+  pending = run(undefined, fits);
+  assert.equal(prompts, before + 1);
+  assert.ok(title.includes(JSON.stringify("# line 25")));
   choose("Deny");
-  await assert.rejects(pending, /refused/);
-
-  // A compacted prompt cannot be approved, even if the UI returns "Allow once".
-  const long = "# " + "x".repeat(2500);
-  pending = run(undefined, long);
-  assert.ok(title.length <= 2200);
-  assert.match(title, /compacted: omitted \d+ characters/);
-  assert.match(title, /Allow once is unavailable/);
-  assert.deepEqual(choices, ["Deny"]);
-  choose("Allow once");
   await assert.rejects(pending, /refused/);
   assert.equal(launch.mock.callCount(), 1);
 });

@@ -202,9 +202,10 @@ While the sandbox is active, ordinary `bash` still runs inside it. The
 interactive Linux/macOS CLI shows the time limit, how much output the agent
 will see, the shell, PATH, resolved working directory and JSON-quoted command
 lines in Pi's standard selector. **Deny** is selected first. **Allow once** runs
-the command once. If the prompt is longer than 32 lines or 2,200 characters, it
-is compacted and only **Deny** is offered, so you never approve text you could
-not see. Escape cancels. RPC, print, JSON and non-TTY sessions cannot approve.
+the command once. A command whose prompt would exceed 32 lines or 2,200
+characters (about 25 command lines) never reaches you: the agent gets a "command
+too long" error with the limit and is asked to shorten or split it, so you never
+approve text you could not see. Escape cancels. RPC, print, JSON and non-TTY sessions cannot approve.
 
 The command runs in a fresh `/bin/bash` with stdin closed, the PATH above and
 the operator's HOME. It has the host user's filesystem and network access.

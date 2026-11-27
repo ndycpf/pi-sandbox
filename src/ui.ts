@@ -51,7 +51,8 @@ export function permissionPromptTimeoutMs(timeoutSeconds: unknown): number | und
   ) {
     return undefined;
   }
-  return Math.min(resolvedTimeoutSeconds * 1000, MAX_TIMER_DELAY_MS);
+  // Whole milliseconds: AbortSignal.timeout rejects fractions such as 1000.9999999999999.
+  return Math.min(Math.ceil(resolvedTimeoutSeconds * 1000), MAX_TIMER_DELAY_MS);
 }
 
 export function permissionPromptRemainingSeconds(deadlineMs: number, nowMs = Date.now()): number {
@@ -186,13 +187,17 @@ async function dialogPermissionPrompt(
   const aborted: PermissionPromptResult = { action: "abort", value: originalValue };
   pi.events.emit("request-attention", { message: "Sandbox permission required" });
   const timeoutMs = permissionPromptTimeoutMs(timeoutSeconds);
+  const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
   const dialog =
     timeoutMs === undefined ? signal : AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
+  // The client gets the time left so it can expire its card when Pi stops waiting.
+  const remaining = () =>
+    deadline === undefined ? undefined : Math.max(1, Math.ceil(deadline - performance.now()));
   const options = permissionOptions(ctx.cwd);
   const labels = options.map((option) =>
     option.hint ? `${option.label} ${option.hint}` : option.label,
   );
-  const choice = await ctx.ui.select(title, labels, { signal: dialog });
+  const choice = await ctx.ui.select(title, labels, { signal: dialog, timeout: remaining() });
   const option = choice === undefined ? undefined : options[labels.indexOf(choice)];
   if (!option || option.action === "abort" || dialog.aborted) return aborted;
   if (validateValue(originalValue) !== null) return aborted;
@@ -200,7 +205,7 @@ async function dialogPermissionPrompt(
     const confirmed = await ctx.ui.confirm(
       `${option.label}?`,
       `Save "${originalValue}" ${option.hint ?? ""}`.trim(),
-      { signal: dialog },
+      { signal: dialog, timeout: remaining() },
     );
     if (confirmed !== true || dialog.aborted) return aborted;
   }

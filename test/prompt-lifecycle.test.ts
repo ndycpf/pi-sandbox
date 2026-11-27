@@ -342,26 +342,29 @@ test("UI failures release the queue without granting permission", { timeout: 200
 test("RPC mode asks through select and confirm dialogs, never the widget", async (t) => {
   const f = fixture(t);
   const asked: { kind: string; title: string; options?: string[] }[] = [];
+  const timeouts: (number | undefined)[] = [];
   let answers: (string | boolean | undefined)[] = [];
   const ui = {
     ...f.ctx.ui,
-    select: async (title: string, options: string[]) => {
+    select: async (title: string, options: string[], opts?: { timeout?: number }) => {
+      timeouts.push(opts?.timeout);
       asked.push({ kind: "select", title, options });
       return answers.shift() as string | undefined;
     },
-    confirm: async (title: string) => {
+    confirm: async (title: string, _message: string, opts?: { timeout?: number }) => {
+      timeouts.push(opts?.timeout);
       asked.push({ kind: "confirm", title });
       return answers.shift() as boolean;
     },
   };
-  const ask = (mode: string, valid = true) =>
+  const ask = (mode: string, valid = true, timeoutSeconds = 0) =>
     prompts.showPermissionPrompt(
       f.pi,
       { ...f.ctx, mode, ui } as unknown as ExtensionContext,
       "Blocked",
       "example.com",
       () => (valid ? null : "bad"),
-      0,
+      timeoutSeconds,
     );
   const labels = prompts
     .permissionOptions("/workspace")
@@ -383,6 +386,16 @@ test("RPC mode asks through select and confirm dialogs, never the widget", async
   }
   answers = [labels[0]];
   assert.equal((await ask("rpc", false)).action, "abort");
+
+  assert.ok(timeouts.every((timeout) => timeout === undefined));
+
+  // A fractional timeout becomes whole milliseconds, and each dialog gets the time left.
+  timeouts.length = 0;
+  answers = [labels[2], true];
+  assert.deepEqual(await ask("rpc", true, 1.001), { action: "project", value: "example.com" });
+  const [select, confirm] = timeouts as unknown as number[];
+  assert.ok(Number.isInteger(select) && select <= 1001 && select > 900);
+  assert.ok(Number.isInteger(confirm) && confirm <= select);
 
   const before = asked.length;
   for (const mode of ["json", "print"]) assert.equal((await ask(mode)).action, "abort");

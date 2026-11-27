@@ -69,6 +69,7 @@ async function approve(
   cwd: string,
   options: HostBashConfig,
   signal: AbortSignal,
+  expires: number,
 ) {
   const output = options.outputBytes
     ? `agent sees last ${options.outputBytes} bytes of output`
@@ -96,7 +97,11 @@ async function approve(
         "Do not move the logic into a script file to shorten it; the operator cannot review a file's contents in the prompt.",
     );
   }
-  const choice = await ctx.ui.select(title, ["Deny", "Allow once"], { signal });
+  // RPC clients get the remaining approval time so they can expire their card;
+  // the TUI selector would add a countdown to the title and change its height.
+  const timeout =
+    ctx.mode === "rpc" ? Math.max(1, Math.ceil(expires - performance.now())) : undefined;
+  const choice = await ctx.ui.select(title, ["Deny", "Allow once"], { signal, timeout });
   if (signal.aborted || choice === undefined) {
     throw new ApprovalRefused(
       signal.reason?.name === "TimeoutError"
@@ -236,7 +241,7 @@ export function registerHostBash(
         const path = hostPath();
         approval.throwIfAborted();
         if (
-          (await approve(ctx, command, cwd, options, approval)) !== true ||
+          (await approve(ctx, command, cwd, options, approval, expires)) !== true ||
           !current() ||
           approval.aborted ||
           performance.now() >= expires ||

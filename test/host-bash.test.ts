@@ -67,7 +67,13 @@ test("host_bash requires one current affirmative terminal approval", async (t) =
     hasUI: true,
     sessionManager: { getSessionId: () => "fixture" },
     ui: {
-      select(text: string, options: string[], { signal }: { signal: AbortSignal }) {
+      select(
+        text: string,
+        options: string[],
+        { signal, timeout }: { signal: AbortSignal; timeout?: number },
+      ) {
+        // The TUI selector would add a countdown to the title.
+        assert.equal(timeout, undefined);
         choices = options;
         title = text;
         prompts++;
@@ -250,12 +256,17 @@ test("host_bash asks an RPC client without a TTY when rpc approval is enabled", 
   });
   let prompts = 0;
   let answer: string | undefined = "Allow once";
+  const timeouts: (number | undefined)[] = [];
   const ctx = {
     cwd: process.cwd(),
     mode: "rpc",
     hasUI: true,
     sessionManager: { getSessionId: () => "fixture" },
-    ui: { select: async () => (prompts++, answer) },
+    ui: {
+      select: async (_title: string, _options: string[], opts: { timeout?: number }) => (
+        prompts++, timeouts.push(opts.timeout), answer
+      ),
+    },
   };
   const context = ctx as unknown as ExtensionContext;
   host.start(context);
@@ -265,6 +276,8 @@ test("host_bash asks an RPC client without a TTY when rpc approval is enabled", 
   for (answer of [undefined, "Deny", "allow once"]) await assert.rejects(run(), /refused/);
   assert.equal(prompts, 4);
   assert.equal(launch.mock.callCount(), 1);
+  // The client is told how long Pi waits for the answer.
+  assert.ok(timeouts.every((ms) => Number.isInteger(ms) && ms! > 0 && ms! <= 60_000));
   // A TUI without a terminal still cannot approve.
   ctx.mode = "tui";
   await assert.rejects(run(), /mode "tui"\) cannot show the operator/);

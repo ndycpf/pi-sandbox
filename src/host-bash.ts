@@ -1,12 +1,28 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-
 import { spawn } from "node:child_process";
 import { closeSync, constants, fstatSync, openSync, realpathSync, statSync } from "node:fs";
+import { join } from "node:path";
 
+import {
+  getAgentDir,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
+import type { ReviewExec } from "./host-review-tools.ts";
+
 import { DEFAULT_HOST_BASH_CONFIG, type HostBashConfig } from "./config.ts";
+import { REJECTION_INSTRUCTIONS } from "./host-review-prompt.ts";
+import {
+  appendReviewLog,
+  type PlannedAction,
+  modelReviewer,
+  type Reviewer,
+  type ReviewThinking,
+  reviewCommand,
+  transcriptRecords,
+} from "./host-review.ts";
 
 const shell = "/bin/bash";
 const refusal = "Host command refused.";
@@ -18,6 +34,8 @@ const outputGraceMs = 200;
 const statCommand =
   process.platform === "darwin" ? "/usr/bin/stat -f %d:%i" : "/usr/bin/stat -c %d:%i";
 let busy = false; // One prompt or process across registrations sharing this module.
+// After this many reviewer denials in a row, the session falls back to human review.
+const maxDenials = 3;
 
 // Reversible ASCII display, including newlines, bidi controls and invisible characters.
 function quoted(value: string) {
@@ -63,17 +81,15 @@ export function titleRows(title: string) {
   return new Text(title, 1, 0).render(assumedColumns).length;
 }
 
-async function approve(
-  ctx: ExtensionContext,
-  command: string,
-  cwd: string,
-  options: HostBashConfig,
-  signal: AbortSignal,
-  expires: number,
-) {
-  const output = options.outputBytes
+function outputPolicy(options: HostBashConfig) {
+  return options.outputBytes
     ? `agent sees last ${options.outputBytes} bytes of output`
     : "agent sees exit status only";
+}
+
+// The approval prompt's text. Throws if the operator could not read all of it.
+function promptTitle(command: string, cwd: string, options: HostBashConfig) {
+  const output = outputPolicy(options);
   const header = [
     "Run outside the OS sandbox? Host files and network are reachable.",
     `${shell}, limit ${options.timeoutSeconds}s, ${output}.`,
@@ -97,6 +113,10 @@ async function approve(
         "Do not move the logic into a script file to shorten it; the operator cannot review a file's contents in the prompt.",
     );
   }
+  return title;
+}
+
+async function approve(ctx: ExtensionContext, title: string, signal: AbortSignal, expires: number) {
   // RPC clients get the remaining approval time so they can expire their card;
   // the TUI selector would add a countdown to the title and change its height.
   const timeout =
@@ -163,14 +183,45 @@ function format(code: number | null, tail: Tail | undefined, path: string) {
   return status + outputText(tail);
 }
 
+export type HostBashDeps = {
+  /** Builds the reviewer for the configured model. */
+  reviewer?: (ctx: ExtensionContext, model: string, thinking: ReviewThinking) => Reviewer;
+  /** Bounded JSONL log of auto-review decisions. */
+  logFile?: string;
+  /** Runs the reviewer's read and ls in the sandbox, read-only and offline. */
+  reviewExec?: ReviewExec;
+};
+
 export function registerHostBash(
   pi: ExtensionAPI,
   ready: () => boolean,
   config: (cwd: string) => HostBashConfig = () => DEFAULT_HOST_BASH_CONFIG,
+  deps: HostBashDeps = {},
 ) {
+  const makeReviewer = deps.reviewer ?? modelReviewer;
+  const logFile = () => deps.logFile ?? join(getAgentDir(), "host-bash-review.log");
   let session:
-    | { manager: ExtensionContext["sessionManager"]; id: string; lifetime: AbortController }
+    | {
+        manager: ExtensionContext["sessionManager"];
+        id: string;
+        lifetime: AbortController;
+        denials: number;
+        /** Auto-review is off for the rest of this session after repeated denials. */
+        paused?: boolean;
+      }
     | undefined;
+  const showStatus = (ctx: ExtensionContext) => {
+    const review = config(ctx.cwd).review;
+    if (review.error)
+      return ctx.ui?.setStatus?.("host-bash", "host_bash: human (review config error)");
+    if (review.mode !== "auto") return ctx.ui?.setStatus?.("host-bash", undefined);
+    ctx.ui?.setStatus?.(
+      "host-bash",
+      session?.paused
+        ? "host_bash: human (auto-review paused)"
+        : `host_bash: auto-review (${review.model})`,
+    );
+  };
 
   pi.registerTool({
     name: "host_bash",
@@ -181,7 +232,8 @@ export function registerHostBash(
       "Use this tool when a sandboxed command fails or gives misleading results because of that, or when the task needs something only the host has. " +
       "Typical signs: 'Operation not permitted', 'Permission denied' outside the workspace, blocked network, 'command not found' for a tool installed on the host (docker, brew, gcloud), " +
       "an unreachable daemon or socket, or missing or invalid credentials (gh, git, cloud CLIs, keychain). " +
-      "Every call prompts the operator, so do not use it for work the sandbox can do. " +
+      "Every call needs approval, by the operator or, when the operator enabled it, an automatic reviewer, so do not use it for work the sandbox can do. " +
+      "Pass `reason`: one sentence on why this needs the host; the reviewer reads it. " +
       "Keep the command short and self-contained: the approval prompt must fit an 80x24 terminal, so a command over about 8 short lines is refused without prompting and must be shortened or split. " +
       "Runs non-interactively with stdin closed, Pi's PATH and HOME (no other environment variables), and a time limit. " +
       "Returns the exit status and, when enabled, the tail of combined stdout/stderr.",
@@ -191,8 +243,16 @@ export function registerHostBash(
       "Do not use host_bash for work that succeeds in the sandbox.",
     ],
     executionMode: "sequential",
-    parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 4096 }) }),
-    async execute(_id, { command }, abort, _update, ctx) {
+    parameters: Type.Object({
+      command: Type.String({ minLength: 1, maxLength: 4096 }),
+      reason: Type.Optional(
+        Type.String({
+          maxLength: 500,
+          description: "One sentence on why this command needs the host instead of the sandbox.",
+        }),
+      ),
+    }),
+    async execute(_id, { command, reason }, abort, _update, ctx) {
       const active = session;
       const options = config(ctx.cwd);
       const current = () =>
@@ -232,19 +292,92 @@ export function registerHostBash(
         if (abort) signals.push(abort);
         if (ctx.signal) signals.push(ctx.signal);
         const lifetime = AbortSignal.any(signals);
-        const expires = performance.now() + deadline;
-        const approval = AbortSignal.any([lifetime, AbortSignal.timeout(deadline)]);
         const original = ctx.cwd;
         const cwd = realpathSync.native(original);
         fd = openSync(cwd, constants.O_RDONLY | constants.O_DIRECTORY);
         const dir = fstatSync(fd, { bigint: true });
         const path = hostPath();
-        approval.throwIfAborted();
+        // Checked before any review, so a call the operator could not read is
+        // never auto-approved either.
+        const title = promptTitle(command, cwd, options);
+        lifetime.throwIfAborted();
+        const review = options.review;
+        let approvedBy: "operator" | "reviewer" = "operator";
+        if (review.mode === "auto" && review.model && !active.paused) {
+          const action: PlannedAction = {
+            tool: "host_bash",
+            command: [shell, "--noprofile", "--norc", "-c", command],
+            cwd,
+            sandbox_permissions: "require_escalated",
+            ...(reason && { justification: reason }),
+            tty: false,
+            env: { PATH: path, ...(process.env.HOME && { HOME: process.env.HOME }) },
+            timeout_seconds: options.timeoutSeconds,
+            output_to_agent: outputPolicy(options),
+          };
+          const verdict = await reviewCommand(
+            makeReviewer(ctx, review.model, review.thinking),
+            review,
+            action,
+            transcriptRecords(ctx.sessionManager.getBranch?.() ?? []),
+            deps.reviewExec,
+            lifetime,
+          );
+          if (!current()) throw new Error(refusal);
+          appendReviewLog(
+            logFile(),
+            {
+              session: active.id,
+              model: review.model,
+              cwd,
+              command,
+              ...(reason && { reason }),
+              ...verdict,
+            },
+            review.log,
+          );
+          if (verdict.decision === "allow") {
+            approvedBy = "reviewer";
+            active.denials = 0;
+            ctx.ui.notify(
+              `host_bash auto-approved (${review.model}): ${quoted(command).slice(0, 200)}\n${verdict.reason}`,
+              "info",
+            );
+          } else if (verdict.decision === "deny") {
+            active.denials++;
+            const paused = active.denials >= maxDenials;
+            if (paused) active.paused = true;
+            ctx.ui.notify(
+              `host_bash denied by auto-review: ${verdict.reason}` +
+                (paused
+                  ? `\nAuto-review paused for this session after ${maxDenials} denials in a row; you will be asked instead.`
+                  : ""),
+              "warning",
+            );
+            showStatus(ctx);
+            throw new ApprovalRefused(
+              `Host command denied by the automatic reviewer: ${verdict.reason} ` +
+                REJECTION_INSTRUCTIONS,
+            );
+          } else {
+            ctx.ui.notify(`host_bash auto-review asks you to decide: ${verdict.reason}`, "info");
+          }
+        }
+        if (approvedBy === "operator") {
+          const expires = performance.now() + deadline;
+          const approval = AbortSignal.any([lifetime, AbortSignal.timeout(deadline)]);
+          approval.throwIfAborted();
+          if (
+            (await approve(ctx, title, approval, expires)) !== true ||
+            approval.aborted ||
+            performance.now() >= expires
+          )
+            throw new Error(refusal);
+          active.denials = 0;
+        }
         if (
-          (await approve(ctx, command, cwd, options, approval, expires)) !== true ||
           !current() ||
-          approval.aborted ||
-          performance.now() >= expires ||
+          lifetime.aborted ||
           ctx.cwd !== original ||
           realpathSync.native(original) !== cwd
         )
@@ -328,7 +461,7 @@ export function registerHostBash(
           }
           return {
             content: [{ type: "text", text: format(code, tail, path) }],
-            details: { exitCode: code },
+            details: { exitCode: code, approvedBy },
           };
         } finally {
           run.removeEventListener("abort", kill);
@@ -350,8 +483,15 @@ export function registerHostBash(
       session?.lifetime.abort();
       const id = ctx.sessionManager?.getSessionId();
       session = id
-        ? { manager: ctx.sessionManager, id, lifetime: new AbortController() }
+        ? { manager: ctx.sessionManager, id, lifetime: new AbortController(), denials: 0 }
         : undefined;
+      showStatus(ctx);
+      const error = config(ctx.cwd).review.error;
+      if (error)
+        ctx.ui?.notify?.(
+          `host_bash auto-review is off: ${error}. Every call is prompted.`,
+          "warning",
+        );
     },
     stop() {
       session?.lifetime.abort();

@@ -246,6 +246,142 @@ will pick up from there, for example:
 
 Use a terminal you control with trusted Pi extensions.
 
+#### Auto-review (optional)
+
+With auto-review on, an LLM reviewer looks at each `host_bash` call first, so
+routine host commands do not need a prompt every time. It is off by default and,
+like the rest of `hostBash`, can only be turned on in the global config:
+
+```jsonc
+{
+  "hostBash": {
+    "enabled": true,
+    "review": {
+      // "human" (default) prompts for every call. "auto" asks the reviewer first.
+      "mode": "auto",
+      // Any model Pi can use, as "provider/model-id". Required for "auto".
+      // Pi's own credentials are used.
+      "model": "anthropic/claude-haiku-4-5",
+      // Optional: extra policy text appended to the built-in one, as an
+      // absolute path or one starting with ~/.
+      "policyFile": "/Users/me/.pi/agent/host-review-policy.md",
+      // Limit for one review, including its file checks (5-180, default 60);
+      // on expiry you are prompted.
+      "timeoutSeconds": 60,
+      // The reviewer's thinking level: "off", "minimal", "low", "medium",
+      // "high", "xhigh" or "max". Default "low", as in Codex's auto-review;
+      // models without reasoning ignore it. Higher levels take longer and
+      // count against timeoutSeconds.
+      "thinking": "low",
+      // Review log at ~/.pi/agent/host-bash-review.log. When a file passes
+      // maxBytes (64 KiB-64 MiB, default 1 MiB) it is rotated, keeping `files`
+      // files (1-20, default 3, about 3 MiB). "enabled": false writes nothing.
+      "log": { "enabled": true, "maxBytes": 1048576, "files": 3 },
+      // Optional: absolute paths of the programs the reviewer's read and ls
+      // run. By default the first that exists of /bin/sh or /usr/bin/sh,
+      // /usr/bin/head or /bin/head, /bin/ls or /usr/bin/ls (macOS and Linux).
+      "binaries": { "sh": "/bin/sh", "head": "/usr/bin/head", "ls": "/bin/ls" }
+    }
+  }
+}
+```
+
+The reviewer works like the auto-review ("Guardian") in OpenAI Codex, and its
+instructions and context are adapted from Codex's open-source reviewer. Its
+system prompt is Codex's reviewer template and default security policy
+(risk taxonomy, user-authorization scoring, data exfiltration, credential
+probing, security weakening, destructive actions), with your `policyFile`
+in Codex's extra-policy slot. Its user message has:
+
+- the session transcript as JSON records: your messages, the agent's text and
+  tool calls, and tool results (reasoning is left out, and so are `!!`
+  commands, which Pi keeps out of model requests). Like Codex, your
+  messages are kept first, then the 40 most recent other entries, within
+  token budgets; long entries are cut in the middle with a `<truncated ... />`
+  marker. Only your messages count as trusted authorization;
+- the planned action JSON: `tool`, the exact `command` argv, `cwd`, the
+  agent's one-line `reason` as `justification`, `PATH` and `HOME`, the time
+  limit and how much output the agent will see.
+
+Like Codex's reviewer, it can check local state before deciding, but only with
+two read-only tools: `read` (up to 16 KiB of a text file, with a line offset)
+and `ls` (up to 200 entries). As in Codex, they run in a sandbox: `head -c`
+and `ls`, by absolute path with a fixed `PATH`, so nothing in the agent's
+`PATH` stands in for them. Writes are denied, and the reviewer's sandbox has a
+network proxy of its own that allows no host, whatever the session allows.
+Reads follow the session's `denyRead`/`allowRead` and `credentials.files`, so
+a denied path fails or looks empty. On top of that, the reviewer never reads
+secret files even where the sandbox could, because what it reads is sent to
+the model provider: `/proc`, `/sys`, `/dev`, `~/.pi/agent/auth.json`,
+`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.config/gh`,
+`~/.config/gcloud`, keychains, `.env*`, `*.pem`/`*.key` and similar, `id_*`,
+`.netrc`, `.npmrc`, credentials files. Each path is checked after resolving
+symlinks, and the sandbox also denies the listed directories and the
+secret-named files under the working directory, so a symlink swapped after
+the check still cannot reach them. These rules are rebuilt for every call; if
+the working directory has over 50,000 entries the reviewer cannot read
+anything, since its secret files cannot all be covered. Only the first 1 MiB
+of a file can be checked. Two gaps remain: secret-named files outside
+the working directory and those directories are refused by the path check
+only, and the sandbox mounts `/proc`, `/sys` and `/dev` itself (there the
+reviewer sees only its own process, whose environment holds just `PATH`,
+`HOME` and the proxy settings). A review gets at most 8 tool calls and 64 KiB of tool
+output. The prompt tells it to look only when the result could change its
+decision (for example the target of an `rm -rf` or a script a command runs) and
+that what it reads is untrusted evidence. Its checks are listed in the review
+log.
+
+It answers with Codex's JSON contract (`outcome` `allow`/`deny`, `risk_level`,
+`user_authorization`, `rationale`):
+
+- **allow** runs the command without a prompt. It is the only answer that does.
+  Codex's thresholds are also enforced outside the model: an allow rated `high`
+  needs `user_authorization` `medium` or `high`, and an allow rated `critical`
+  never runs. An allow that breaks them shows you the prompt.
+- An error, a timeout, a missing model or credentials, or an answer without a
+  valid `outcome` shows you the normal prompt.
+- **deny** returns the rationale to the agent with Codex's rejection
+  instructions (no workaround; use a safer alternative or ask you), without
+  prompting you. If you then approve the action in the chat, the next review
+  sees that in the transcript. After 3 denials in a row, auto-review pauses for
+  the rest of the session and every call is prompted.
+
+Auto-review is turned on and off only in the global config; restart Pi after
+changing it. An `"auto"` config with a bad `model`, `policyFile`, `thinking` or `binaries` entry is not used:
+every call is prompted, and Pi shows the error at session start and
+`host_bash: human (review config error)` in the status bar.
+
+Some commands always come to you whatever the reviewer would say: `sudo` and
+similar, `rm` with `-r` or `-f`, piping into a shell, disk-level tools, paths
+or commands that look like credentials (`~/.ssh`, `~/.aws`, keychain,
+`gh auth token`, ...), and `eval`/`exec`/base64-decoding. This list is a speed
+bump, not a boundary; it is easy to spell the same action another way.
+
+All existing guards still apply: the 80x24 size limit (an oversized command is
+refused before review), the working-directory re-check, the time limit and the
+output cap. Auto-review runs only where manual approval could, because it can
+fall back to you: the TUI on a terminal, or an RPC client when `approvalModes`
+includes `"rpc"` (fallback prompts then go to the client's dialog). The status
+bar shows `host_bash: auto-review (<model>)`, each auto-approved or denied run
+is shown as a notification (in RPC mode, sent to the client), and every review is appended to
+`~/.pi/agent/host-bash-review.log` as JSON lines. The log is bounded: past
+`maxBytes` it is renamed to `.1` (older files shift to `.2`, ...) and the oldest
+beyond `files` is deleted. Pi's own session history under
+`~/.pi/agent/sessions/` has no automatic cleanup.
+
+**What auto-review cannot catch.** The reviewer can read files, but it may not
+look, and it cannot follow everything a command touches: a harmless-looking
+`make test` or `git commit` can run code several files deep, from paths it
+cannot read, or fetched at run time. Text in the command, the agent's reason,
+tool output, files it reads (which the agent may have written) or your pasted
+messages can try to talk it into `allow` (prompt injection). It can misjudge what a command does, especially an
+unusual or obfuscated one. Commands it allows run with your full user rights,
+and each review sends the command, working directory, `PATH`, the session
+transcript (up to roughly 30k tokens) and the files it reads to the model
+provider you configured. Use auto-review for convenience
+on a machine and model you trust, not as a security boundary; keep `mode:
+"human"` where a wrong `allow` would be costly.
+
 ### What is prompted vs. hard-blocked
 
 | Rule | Behaviour |
@@ -323,3 +459,8 @@ Based on code from
 [badlogic/pi-mono](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/examples/extensions/sandbox/index.ts)
 by Mario Zechner, used under the
 [MIT License](https://github.com/badlogic/pi-mono/blob/main/LICENSE).
+
+The `host_bash` auto-review instructions and context framing
+(`src/host-review-prompt.ts`) are adapted from
+[OpenAI Codex](https://github.com/openai/codex), Copyright 2025 OpenAI, used
+under the Apache License 2.0; see `third-party/openai-codex/`.

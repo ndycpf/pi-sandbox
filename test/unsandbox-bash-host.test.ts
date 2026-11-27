@@ -85,7 +85,10 @@ test("outputBytes 0 returns the exit status only", { skip: !supported }, async (
 test("host command is killed at its time limit", { skip: !supported }, async (t) => {
   const { cwd, run } = fixture(t, { timeoutSeconds: 1 });
   const started = Date.now();
-  await assert.rejects(run("sleep 30; touch late"), /interrupted/);
+  await assert.rejects(
+    run("echo started; sleep 30; touch late"),
+    /timed out after 1s and was killed[\s\S]*started/,
+  );
   assert.ok(Date.now() - started < 10_000);
   assert.throws(() => readFileSync(join(cwd, "late")));
 });
@@ -124,3 +127,11 @@ test(
     assert.throws(() => readFileSync(join(cwd, "ran")));
   },
 );
+
+test("exit 127 explains how to extend the host PATH", { skip: !supported }, async (t) => {
+  const { run } = fixture(t);
+  const result = await run("definitely-not-a-command-xyz");
+  assert.deepEqual(result.details, { exitCode: 127 });
+  assert.match(result.text, /not found on the host PATH \(\/usr\/bin:\/bin\)/);
+  assert.match(result.text, /hostBash\.extraPath/);
+});

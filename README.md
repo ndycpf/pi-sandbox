@@ -187,8 +187,8 @@ restart Pi after enabling it.
 {
   "hostBash": {
     "enabled": true,
-    // Appended after /usr/bin:/bin. Entries in the workspace or temp directory are dropped.
-    "extraPath": ["/opt/homebrew/bin", "/usr/local/bin"],
+    // Appended after /usr/bin:/bin; "~/" is expanded. Entries in the workspace or temp directory are dropped.
+    "extraPath": ["/opt/homebrew/bin", "/usr/local/bin", "~/.docker/bin"],
     // Execution limit for one command (1-3600, default 60).
     "timeoutSeconds": 300,
     // Tail of combined stdout/stderr returned to the agent (0-65536, default 16384).

@@ -27,6 +27,7 @@ function quoted(value: string) {
 }
 
 class ApprovalRefused extends Error {}
+class HostCommandStopped extends Error {}
 
 const maxPromptLines = 32;
 const maxPromptChars = 2200;
@@ -125,16 +126,26 @@ class Tail {
   }
 }
 
-function format(code: number | null, tail: Tail | undefined) {
-  const status = "Host Bash exit status: " + (code ?? "terminated by signal");
-  if (!tail) return status;
-  if (!tail.total) return status + "\nNo output.";
+function outputText(tail: Tail | undefined) {
+  if (!tail) return "";
+  if (!tail.total) return "\nNo output.";
   const shown = Math.min(tail.total, tail.limitBytes);
   const header =
     shown < tail.total
       ? `Output (last ${shown} of ${tail.total} bytes, stdout and stderr interleaved):`
       : "Output (stdout and stderr interleaved):";
-  return status + "\n" + header + "\n" + tail.text();
+  return "\n" + header + "\n" + tail.text();
+}
+
+function format(code: number | null, tail: Tail | undefined, path: string) {
+  let status = "Host Bash exit status: " + (code ?? "terminated by signal");
+  if (code === 127) {
+    status +=
+      `\nExit status 127 usually means a program was not found on the host PATH (${path}). ` +
+      "Report this to the operator: if the program is installed elsewhere, they can add its directory to hostBash.extraPath in the global sandbox.json. " +
+      "Do not retry the same command.";
+  }
+  return status + outputText(tail);
 }
 
 export function registerUnsandboxBash(
@@ -250,7 +261,8 @@ export function registerUnsandboxBash(
         for (const stream of [child.stdout, child.stderr]) {
           stream?.on("data", (chunk: Buffer) => tail?.push(chunk));
         }
-        const run = AbortSignal.any([lifetime, AbortSignal.timeout(options.timeoutSeconds * 1000)]);
+        const limit = AbortSignal.timeout(options.timeoutSeconds * 1000);
+        const run = AbortSignal.any([lifetime, limit]);
         const kill = () => {
           if (child.pid) {
             try {
@@ -270,7 +282,15 @@ export function registerUnsandboxBash(
             child.once("error", reject);
             child.once("exit", resolve);
           });
-          run.throwIfAborted();
+          if (run.aborted) {
+            throw new HostCommandStopped(
+              (limit.aborted
+                ? `Host command timed out after ${options.timeoutSeconds}s and was killed (limit: hostBash.timeoutSeconds in the global sandbox.json). ` +
+                  "Do not retry it unchanged; run a shorter step or ask the operator to raise the limit."
+                : "Host command interrupted: the call was cancelled or the session ended, and the command was killed.") +
+                outputText(tail),
+            );
+          }
           if (!(await verified)) {
             throw new ApprovalRefused(
               "Host command refused: the working directory changed before execution.",
@@ -286,7 +306,7 @@ export function registerUnsandboxBash(
             clearTimeout(timer);
           }
           return {
-            content: [{ type: "text", text: format(code, tail) }],
+            content: [{ type: "text", text: format(code, tail, path) }],
             details: { exitCode: code },
           };
         } finally {
@@ -296,7 +316,7 @@ export function registerUnsandboxBash(
           report?.destroy();
         }
       } catch (error) {
-        if (error instanceof ApprovalRefused) throw error;
+        if (error instanceof ApprovalRefused || error instanceof HostCommandStopped) throw error;
         throw new Error(started ? "Host command interrupted." : refusal);
       } finally {
         busy = false;

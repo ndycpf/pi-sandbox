@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
@@ -85,9 +86,11 @@ export function resolveHostBashConfig(value: unknown): HostBashConfig {
     enabled: raw.enabled === true,
     extraPath: [
       ...new Set(
-        (stringArray(raw.extraPath) ?? []).filter(
-          (entry) => entry.startsWith("/") && !entry.includes(":") && !entry.includes("\0"),
-        ),
+        (stringArray(raw.extraPath) ?? [])
+          .map((entry) => (entry.startsWith("~/") ? join(homedir(), entry.slice(2)) : entry))
+          .filter(
+            (entry) => entry.startsWith("/") && !entry.includes(":") && !entry.includes("\0"),
+          ),
       ),
     ],
     timeoutSeconds: boundedInteger(raw.timeoutSeconds, 1, 3600, defaults.timeoutSeconds),

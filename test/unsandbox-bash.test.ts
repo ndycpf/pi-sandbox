@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import childProcess, { ChildProcess } from "node:child_process";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -201,6 +201,9 @@ test("hostBash config is global-only and validated", () => {
     DEFAULT_HOST_BASH_CONFIG,
   );
   assert.equal(resolveHostBashConfig({ timeoutSeconds: 600, outputBytes: 0 }).outputBytes, 0);
+  assert.deepEqual(resolveHostBashConfig({ extraPath: ["~/.docker/bin", "~x"] }).extraPath, [
+    join(homedir(), ".docker/bin"),
+  ]);
 });
 
 test("hostPath keeps system directories first and drops sandbox-writable entries", () => {

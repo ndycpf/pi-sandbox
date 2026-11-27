@@ -20,6 +20,8 @@ export type SandboxConfig = Omit<SandboxRuntimeConfig, "network" | "filesystem">
   sandboxUserShell?: boolean;
   enableAccessRequestTool?: boolean;
   permissionPromptTimeoutSeconds?: number;
+  /** Operator-approved host Bash tool. Global-only; project values are ignored. */
+  hostBash?: Partial<HostBashConfig>;
   network?: NonNullable<SandboxRuntimeConfig["network"]> & {
     allowUnauthenticatedSocksProxy?: boolean;
     /** Route ordinary `ssh` commands through the sandbox SOCKS proxy. */
@@ -50,6 +52,48 @@ export type SandboxConfigFile = Omit<Partial<SandboxConfig>, "network" | "filesy
 };
 
 export const DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS = 10 * 60;
+
+export type HostBashConfig = {
+  /** Register `bash_with_human_approval`. */
+  enabled: boolean;
+  /** Absolute directories appended after `/usr/bin:/bin` for host commands. */
+  extraPath: string[];
+  /** Execution limit for one approved command. */
+  timeoutSeconds: number;
+  /** Bytes of combined stdout/stderr tail returned to the agent; 0 returns exit status only. */
+  outputBytes: number;
+};
+
+export const DEFAULT_HOST_BASH_CONFIG: HostBashConfig = {
+  enabled: false,
+  extraPath: [],
+  timeoutSeconds: 60,
+  outputBytes: 16 * 1024,
+};
+
+function boundedInteger(value: unknown, min: number, max: number, fallback: number) {
+  return Number.isInteger(value) && (value as number) >= min && (value as number) <= max
+    ? (value as number)
+    : fallback;
+}
+
+/** Validate a global `hostBash` entry, dropping invalid values. */
+export function resolveHostBashConfig(value: unknown): HostBashConfig {
+  const raw = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+  const defaults = DEFAULT_HOST_BASH_CONFIG;
+  return {
+    enabled: raw.enabled === true,
+    extraPath: [
+      ...new Set(
+        (stringArray(raw.extraPath) ?? []).filter(
+          (entry) => entry.startsWith("/") && !entry.includes(":") && !entry.includes("\0"),
+        ),
+      ),
+    ],
+    timeoutSeconds: boundedInteger(raw.timeoutSeconds, 1, 3600, defaults.timeoutSeconds),
+    outputBytes: boundedInteger(raw.outputBytes, 0, 64 * 1024, defaults.outputBytes),
+  };
+}
 
 export const DEFAULT_CONFIG: SandboxConfig = {
   enabled: true,
@@ -121,6 +165,8 @@ export function mergeConfigLayers(
     ...merged,
     // Cross-sandbox signals can affect unrelated host processes; only global config may grant them.
     allowProcessSignals: globalConfig.allowProcessSignals === true,
+    // Host execution bypasses the sandbox; a project file must not enable or widen it.
+    hostBash: resolveHostBashConfig(globalConfig.hostBash),
     network: {
       ...merged.network,
       allowedDomains:

@@ -14,6 +14,7 @@ import {
   addWritePathToConfig,
   getConfigPaths,
   loadConfig,
+  resolveHostBashConfig,
 } from "./config.ts";
 import {
   canonicalizePath,
@@ -62,7 +63,8 @@ export default function (pi: ExtensionAPI) {
 
   let sandboxEnabled = false;
   let sandboxInitialized = false;
-  const hostBash = registerUnsandboxBash(pi, () => sandboxEnabled && sandboxInitialized);
+  // Registered on session start only when global config enables it.
+  let hostBash: ReturnType<typeof registerUnsandboxBash> | undefined;
   let projectTrusted = false;
   const allowances: SessionAllowances = { domains: [], readPaths: [], writePaths: [] };
 
@@ -132,7 +134,7 @@ export default function (pi: ExtensionAPI) {
       return false;
     }
 
-    hostBash.start(ctx);
+    hostBash?.start(ctx);
     try {
       await initializeSandbox(sandboxManager, config, allowances, ctx.cwd);
       if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
@@ -163,7 +165,7 @@ export default function (pi: ExtensionAPI) {
       return false;
     }
 
-    hostBash.stop();
+    hostBash?.stop();
     cancelPermissionPrompts(pi);
     if (sandboxInitialized) {
       try {
@@ -472,10 +474,18 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    hostBash.stop();
+    hostBash?.stop();
     projectTrusted = ctx.isProjectTrusted();
     if (loadConfig(ctx.cwd, projectTrusted).enableAccessRequestTool === true) {
       registerAccessTools();
+    }
+    if (!hostBash && loadConfig(ctx.cwd, projectTrusted).hostBash?.enabled === true) {
+      hostBash = registerUnsandboxBash(
+        pi,
+        () => sandboxEnabled && sandboxInitialized,
+        // hostBash is global-only, so project trust does not change it.
+        (cwd) => resolveHostBashConfig(loadConfig(cwd, false).hostBash),
+      );
     }
     if (pi.getFlag("no-sandbox") as boolean) {
       sandboxEnabled = false;
@@ -487,12 +497,12 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("Sandbox disabled via config", "info");
       return;
     }
-    if (sandboxEnabled) hostBash.start(ctx);
+    if (sandboxEnabled) hostBash?.start(ctx);
     await enableSandbox(ctx, true);
   });
 
   pi.on("session_shutdown", async () => {
-    hostBash.stop();
+    hostBash?.stop();
     cancelPermissionPrompts(pi);
     if (!sandboxInitialized) return;
     try {

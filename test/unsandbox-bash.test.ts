@@ -9,7 +9,13 @@ import test from "node:test";
 
 import assert from "node:assert/strict";
 
-import { registerUnsandboxBash } from "../src/unsandbox-bash.ts";
+import {
+  DEFAULT_CONFIG,
+  DEFAULT_HOST_BASH_CONFIG,
+  mergeConfigLayers,
+  resolveHostBashConfig,
+} from "../src/config.ts";
+import { hostPath, registerUnsandboxBash } from "../src/unsandbox-bash.ts";
 
 test("bash_with_human_approval requires one current affirmative terminal approval", async (t) => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-approval-")));
@@ -32,6 +38,7 @@ test("bash_with_human_approval requires one current affirmative terminal approva
       },
     } as ExtensionAPI,
     () => true,
+    () => ({ ...DEFAULT_HOST_BASH_CONFIG, enabled: true }),
   );
   const launch = t.mock.method(childProcess, "spawn", () => {
     const child = new ChildProcess();
@@ -47,7 +54,8 @@ test("bash_with_human_approval requires one current affirmative terminal approva
     syncBuiltinESMExports();
   });
   let title = "",
-    prompts = 0;
+    prompts = 0,
+    choices: string[] = [];
   let choose!: (choice?: string) => void;
   const ctx = {
     cwd,
@@ -56,7 +64,7 @@ test("bash_with_human_approval requires one current affirmative terminal approva
     sessionManager: { getSessionId: () => "fixture" },
     ui: {
       select(text: string, options: string[], { signal }: { signal: AbortSignal }) {
-        assert.deepEqual(options, ["Deny", "Allow once"]);
+        choices = options;
         title = text;
         prompts++;
         return new Promise<string | undefined>((done) => {
@@ -87,6 +95,8 @@ test("bash_with_human_approval requires one current affirmative terminal approva
   await assert.rejects(pending, /refused/);
   pending = run();
   assert.ok(title.includes(JSON.stringify(cwd)) && title.includes(JSON.stringify(command)));
+  assert.deepEqual(choices, ["Deny", "Allow once"]);
+  assert.match(title, /Limit: 60s; last 16384 bytes of stdout\/stderr are returned/);
   choose("Allow once");
   assert.deepEqual((await pending).details, { exitCode: 0 });
   assert.equal(launch.mock.callCount(), 1);
@@ -114,16 +124,87 @@ test("bash_with_human_approval requires one current affirmative terminal approva
   const multiline = Array.from({ length: 32 }, (_, i) => `# line ${i}`).join("\n");
   pending = run(undefined, multiline);
   assert.equal(title.split("\n").length, 32);
-  assert.match(title, /compacted: omitted 5 lines and/);
+  assert.match(title, /compacted: omitted 7 lines and/);
+  assert.deepEqual(choices, ["Deny"]);
   choose("Deny");
   await assert.rejects(pending, /refused/);
 
+  // A compacted prompt cannot be approved, even if the UI returns "Allow once".
   const long = "# " + "x".repeat(2500);
   pending = run(undefined, long);
   assert.ok(title.length <= 2200);
   assert.match(title, /compacted: omitted \d+ characters/);
+  assert.match(title, /Allow once is unavailable/);
+  assert.deepEqual(choices, ["Deny"]);
   choose("Allow once");
-  await pending;
-  assert.equal(launch.mock.calls.at(-1)?.arguments[1]?.at(-1), long);
-  assert.equal(launch.mock.callCount(), 2);
+  await assert.rejects(pending, /refused/);
+  assert.equal(launch.mock.callCount(), 1);
+});
+
+test("bash_with_human_approval refuses when hostBash is disabled", async (t) => {
+  let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
+  const host = registerUnsandboxBash(
+    { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,
+    () => true,
+    () => DEFAULT_HOST_BASH_CONFIG,
+  );
+  let prompts = 0;
+  const ctx = {
+    cwd: process.cwd(),
+    mode: "tui",
+    hasUI: true,
+    sessionManager: { getSessionId: () => "fixture" },
+    ui: { select: async () => (prompts++, "Allow once") },
+  } as unknown as ExtensionContext;
+  for (const stream of [process.stdin, process.stdout]) {
+    const previous = Object.getOwnPropertyDescriptor(stream, "isTTY");
+    Object.defineProperty(stream, "isTTY", { configurable: true, value: true });
+    t.after(() =>
+      previous
+        ? Object.defineProperty(stream, "isTTY", previous)
+        : Reflect.deleteProperty(stream, "isTTY"),
+    );
+  }
+  host.start(ctx);
+  t.after(() => host.stop());
+  await assert.rejects(
+    tool.execute("t", { command: "true" }, undefined, undefined, ctx),
+    /refused/,
+  );
+  assert.equal(prompts, 0);
+});
+
+test("hostBash config is global-only and validated", () => {
+  const merged = mergeConfigLayers(
+    DEFAULT_CONFIG,
+    { hostBash: { enabled: true, extraPath: ["/opt/homebrew/bin", "relative", "/a:/b"] } },
+    { hostBash: { enabled: false, extraPath: ["/evil"], timeoutSeconds: 3000 } },
+  );
+  assert.deepEqual(merged.hostBash, {
+    enabled: true,
+    extraPath: ["/opt/homebrew/bin"],
+    timeoutSeconds: 60,
+    outputBytes: 16384,
+  });
+  assert.equal(
+    mergeConfigLayers(DEFAULT_CONFIG, {}, { hostBash: { enabled: true } }).hostBash?.enabled,
+    false,
+  );
+  assert.deepEqual(
+    resolveHostBashConfig({ timeoutSeconds: 0, outputBytes: 1e9 }),
+    DEFAULT_HOST_BASH_CONFIG,
+  );
+  assert.equal(resolveHostBashConfig({ timeoutSeconds: 600, outputBytes: 0 }).outputBytes, 0);
+});
+
+test("hostPath keeps system directories first and drops sandbox-writable entries", () => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-path-")));
+  try {
+    assert.equal(
+      hostPath(["/opt/homebrew/bin", join(cwd, "bin"), "/tmp/bin", join(tmpdir(), "x")], cwd),
+      "/usr/bin:/bin:/opt/homebrew/bin",
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });

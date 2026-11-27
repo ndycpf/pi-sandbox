@@ -177,20 +177,43 @@ consistently.
 
 ### Bash with human approval
 
-While the sandbox is active, ordinary `bash` runs inside it. An agent can call
-`bash_with_human_approval` to ask the human operator to approve one `command`
-outside the sandbox. The interactive Linux/macOS CLI shows the shell, resolved working
-directory and JSON-quoted command lines in Pi's standard selector. **Deny**
-is selected first. **Allow once** runs the entire original command, including
-any text omitted from previews over 32 lines or 2,200 characters. Escape cancels.
-RPC, print, JSON and non-TTY sessions cannot approve.
+`bash_with_human_approval` lets an agent ask the human operator to run one
+`command` outside the sandbox. It is off by default. Enable it in the **global**
+config only (`~/.pi/agent/sandbox.json`); a `hostBash` entry in a project
+`.pi/sandbox.json` is ignored. The tool is registered at session start, so
+restart Pi after enabling it.
 
-The command runs once in a fresh `/bin/bash` with a system PATH and the
-operator's HOME. It has the host user's filesystem and network access. Only
-the exit status is returned. Approval and execution each have a 60-second
-limit. Changes or detached processes can outlive the command. Use a terminal
-you control with trusted Pi extensions. This action stores no approval and
-does not retry a previous call or change the session's sandbox settings.
+```jsonc
+{
+  "hostBash": {
+    "enabled": true,
+    // Appended after /usr/bin:/bin. Entries in the workspace or temp directory are dropped.
+    "extraPath": ["/opt/homebrew/bin", "/usr/local/bin"],
+    // Execution limit for one command (1-3600, default 60).
+    "timeoutSeconds": 300,
+    // Tail of combined stdout/stderr returned to the agent (0-65536, default 16384).
+    // 0 returns the exit status only.
+    "outputBytes": 16384
+  }
+}
+```
+
+While the sandbox is active, ordinary `bash` still runs inside it. The
+interactive Linux/macOS CLI shows the time limit, how much output the agent
+will see, the shell, PATH, resolved working directory and JSON-quoted command
+lines in Pi's standard selector. **Deny** is selected first. **Allow once** runs
+the command once. If the prompt is longer than 32 lines or 2,200 characters, it
+is compacted and only **Deny** is offered, so you never approve text you could
+not see. Escape cancels. RPC, print, JSON and non-TTY sessions cannot approve.
+
+The command runs in a fresh `/bin/bash` with stdin closed, the PATH above and
+the operator's HOME. It has the host user's filesystem and network access.
+The returned output can include anything the command prints, so it reaches the
+model. Approval has a 60-second limit. Changes or detached processes can outlive
+the command. Use a terminal you control with trusted Pi extensions. This action
+stores no approval and does not retry a previous call or change the session's
+sandbox settings. Keep directories in `extraPath` out of the agent's sandbox
+write access, or a sandboxed command could plant a program there.
 
 ### What is prompted vs. hard-blocked
 

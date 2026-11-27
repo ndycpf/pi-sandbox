@@ -97,3 +97,30 @@ test("background descendants do not hold the result open", { skip: !supported },
   assert.ok(Date.now() - started < 3_000);
   assert.match(result.text, /before/);
 });
+
+test(
+  "launcher refuses when its cwd is not the approved directory",
+  { skip: !supported },
+  async (t) => {
+    const { cwd, run } = fixture(t);
+    // Swap the approved directory for another one at the same path between the
+    // parent's last check and the launcher's own check.
+    const real = await import("node:child_process");
+    const original = real.spawn;
+    const { renameSync, mkdirSync } = await import("node:fs");
+    const mock = t.mock.method(real.default, "spawn", (...args: Parameters<typeof original>) => {
+      renameSync(cwd, cwd + "-moved");
+      mkdirSync(cwd);
+      t.after(() => rmSync(cwd + "-moved", { recursive: true, force: true }));
+      return original(...args);
+    });
+    const { syncBuiltinESMExports } = await import("node:module");
+    syncBuiltinESMExports();
+    t.after(() => {
+      mock.mock.restore();
+      syncBuiltinESMExports();
+    });
+    await assert.rejects(run("touch ran"), /working directory changed/);
+    assert.throws(() => readFileSync(join(cwd, "ran")));
+  },
+);

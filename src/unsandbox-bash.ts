@@ -14,6 +14,8 @@ const refusal = "Host command refused.";
 const deadline = 60_000; // Approval limit.
 const systemPath = "/usr/bin:/bin";
 const outputGraceMs = 200;
+// Prints "device:inode" of a path; device numbers match Node's fstat().dev.
+const statCommand = process.platform === "darwin" ? "stat -f %d:%i" : "stat -c %d:%i";
 let busy = false; // One prompt or process across registrations sharing this module.
 
 // Reversible ASCII display, including newlines, bidi controls and invisible characters.
@@ -155,14 +157,18 @@ export function registerUnsandboxBash(
     label: "Bash with human approval",
     description:
       "Run one Bash command on the host, outside the OS sandbox, after the human operator approves it in the interactive CLI. " +
-      "Use ordinary bash first; call this only when a command needs access the sandbox blocks (network hosts, paths outside the workspace, host services) " +
-      "and repeating it in the sandbox cannot work. Every call prompts the operator. " +
+      "Ordinary bash runs inside the sandbox, which blocks paths outside the workspace, most network hosts, local services and credential stores. " +
+      "Use this tool when a sandboxed command fails or gives misleading results because of that, or when the task needs something only the host has. " +
+      "Typical signs: 'Operation not permitted', 'Permission denied' outside the workspace, blocked network, 'command not found' for a tool installed on the host (docker, brew, gcloud), " +
+      "an unreachable daemon or socket, or missing or invalid credentials (gh, git, cloud CLIs, keychain). " +
+      "Every call prompts the operator, so do not use it for work the sandbox can do. " +
       "Keep the command short and self-contained: if it does not fit the prompt in full (about 25 lines), it is refused. " +
-      "Runs non-interactively with stdin closed, a minimal environment and a time limit. " +
+      "Runs non-interactively with stdin closed, a minimal PATH and environment, and a time limit. " +
       "Returns the exit status and, when enabled, the tail of combined stdout/stderr.",
     promptSnippet: "Ask the operator to run one Bash command outside the sandbox",
     promptGuidelines: [
-      "Use bash_with_human_approval only after sandboxed bash fails because of sandbox restrictions, and explain in your reply why host access is needed.",
+      "When sandboxed bash is blocked or misleading because of the sandbox (permission errors, blocked network, a host tool not found, an unreachable daemon, invalid credentials), do not give up or report the sandboxed result as the host state: call bash_with_human_approval with the same command and say in one sentence why host access is needed.",
+      "Do not use bash_with_human_approval for work that succeeds in the sandbox.",
     ],
     executionMode: "sequential",
     parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 4096 }) }),
@@ -219,18 +225,32 @@ export function registerUnsandboxBash(
           throw new Error(refusal);
         const now = statSync(cwd, { bigint: true });
         if (dir.dev !== now.dev || dir.ino !== now.ino) throw new Error(refusal);
-        // Check the actual child cwd against the open approved directory before exec.
-        // Command text is one argv element, never interpolated into the launcher.
-        const guard =
-          '[[ . -ef /dev/fd/3 ]] || exit 125; exec 3<&-; exec /bin/bash --noprofile --norc -c "$1"';
+        // The launcher compares its actual cwd with the approved directory's device
+        // and inode, then reports success on fd 3 before exec. (`-ef /dev/fd/N`
+        // does not work for directory descriptors on macOS.) Command text is one
+        // argv element, never interpolated into the launcher.
+        const identity = `${dir.dev}:${dir.ino}`;
+        const guard = `[[ "$(${statCommand} .)" == "$2" ]] || exit 125; printf ok >&3; exec 3>&-; exec /bin/bash --noprofile --norc -c "$1"`;
         const tail = options.outputBytes ? new Tail(options.outputBytes) : undefined;
         const env: Record<string, string> = { PATH: path };
         if (process.env.HOME) env.HOME = process.env.HOME;
-        const child = spawn(shell, ["--noprofile", "--norc", "-c", guard, "bash", command], {
-          cwd,
-          detached: true,
-          stdio: ["ignore", tail ? "pipe" : "ignore", tail ? "pipe" : "ignore", fd],
-          env,
+        const child = spawn(
+          shell,
+          ["--noprofile", "--norc", "-c", guard, "bash", command, identity],
+          {
+            cwd,
+            detached: true,
+            stdio: ["ignore", tail ? "pipe" : "ignore", tail ? "pipe" : "ignore", "pipe"],
+            env,
+          },
+        );
+        const report = child.stdio[3];
+        const verified = new Promise<boolean>((done) => {
+          if (!report) return done(false);
+          let text = "";
+          report.on("data", (chunk: Buffer) => (text += chunk.toString()));
+          report.once("close", () => done(text === "ok"));
+          report.once("error", () => done(false));
         });
         const closed = new Promise<void>((done) => child.once("close", () => done()));
         for (const stream of [child.stdout, child.stderr]) {
@@ -257,6 +277,11 @@ export function registerUnsandboxBash(
             child.once("exit", resolve);
           });
           run.throwIfAborted();
+          if (!(await verified)) {
+            throw new ApprovalRefused(
+              "Host command refused: the working directory changed before execution.",
+            );
+          }
           // Let buffered output drain; detached descendants may hold the pipes open.
           if (tail) {
             let timer: NodeJS.Timeout | undefined;
@@ -274,6 +299,7 @@ export function registerUnsandboxBash(
           run.removeEventListener("abort", kill);
           child.stdout?.destroy();
           child.stderr?.destroy();
+          report?.destroy();
         }
       } catch (error) {
         if (error instanceof ApprovalRefused) throw error;

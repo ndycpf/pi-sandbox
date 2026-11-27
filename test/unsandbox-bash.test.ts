@@ -5,6 +5,7 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import assert from "node:assert/strict";
@@ -42,8 +43,11 @@ test("bash_with_human_approval requires one current affirmative terminal approva
   );
   const launch = t.mock.method(childProcess, "spawn", () => {
     const child = new ChildProcess();
+    const report = new PassThrough();
+    Object.defineProperty(child, "stdio", { value: [null, null, null, report] });
     queueMicrotask(() => {
       child.emit("spawn");
+      report.end("ok");
       child.emit("exit", 0);
     });
     return child;

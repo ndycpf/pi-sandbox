@@ -165,6 +165,11 @@ or set it to `0` to wait indefinitely. A timeout never grants permission.
 - Allow for this project — written to `.pi/sandbox.json`
 - Allow for all projects — written to Pi's global agent directory (by default, `~/.pi/agent/sandbox.json`; respects `PI_CODING_AGENT_DIR`)
 
+In non-TUI hosts with a UI, such as RPC mode (`pi --mode rpc`, for example Orca's
+chat view), the same choices are sent to the client as a select dialog. The rule
+is the blocked value as shown; editing it needs the TUI. Hosts without a UI have
+no dialog, so a blocked request stays blocked.
+
 **Session allowances** are held in memory only. They are never written to disk
 and the agent has no way to read or modify them. They are reset when the
 extension reloads or pi restarts. Parent agents and subagents have separate
@@ -190,7 +195,10 @@ restart Pi after enabling it.
     "timeoutSeconds": 300,
     // Tail of combined stdout/stderr returned to the agent (0-65536, default 16384).
     // 0 returns the exit status only.
-    "outputBytes": 16384
+    "outputBytes": 16384,
+    // Pi modes that may answer the prompt (default ["tui", "rpc"]).
+    // Remove "rpc" to refuse host_bash in RPC clients.
+    "approvalModes": ["tui", "rpc"]
   }
 }
 ```
@@ -205,7 +213,16 @@ the header. A longer command never reaches you: the agent gets a
 "command too long" error with the budget and is asked to shorten or split it, so
 you do not approve text you could not see in such a terminal. A window smaller
 than 80x24, or many extension widgets below the prompt, can still push the top
-of the prompt off screen; keep the terminal at least that size. Escape cancels. RPC, print, JSON and non-TTY sessions cannot approve.
+of the prompt off screen; keep the terminal at least that size. Escape cancels.
+
+In RPC mode (`pi --mode rpc`, for example Orca's chat view) the same prompt is
+sent to the client as a select dialog with the same two choices, and no TTY is
+needed. Only an exact **Allow once** answer runs the command; a cancelled, timed
+out or unexpected answer refuses it. Pi cannot tell whether a person picked the
+answer, so this trusts the RPC client to show the prompt to you and relay only
+your choice; remove `"rpc"` from `approvalModes` if that does not hold. Print
+and JSON sessions, and a TUI without a terminal, cannot approve: the agent is
+told that no approval prompt is available rather than that you denied it.
 
 The command runs in a fresh `/bin/bash --noprofile --norc` with stdin closed,
 the `PATH` Pi was started with and the operator's HOME, like a command typed in

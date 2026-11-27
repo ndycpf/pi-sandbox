@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 
 import childProcess, { ChildProcess } from "node:child_process";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
@@ -85,7 +85,7 @@ test("host_bash requires one current affirmative terminal approval", async (t) =
       },
     },
   };
-  const context = ctx as unknown as ExtensionContext;
+  const context = ctx as unknown as ExtensionToolContext;
   host.start(context);
   t.after(() => host.stop());
   const command = "printf x >> proof";
@@ -175,7 +175,7 @@ test("host_bash refuses when hostBash is disabled", async (t) => {
     hasUI: true,
     sessionManager: { getSessionId: () => "fixture" },
     ui: { select: async () => (prompts++, "Allow once") },
-  } as unknown as ExtensionContext;
+  } as unknown as ExtensionToolContext;
   for (const stream of [process.stdin, process.stdout]) {
     const previous = Object.getOwnPropertyDescriptor(stream, "isTTY");
     Object.defineProperty(stream, "isTTY", { configurable: true, value: true });
@@ -285,7 +285,7 @@ test("host_bash asks an RPC client without a TTY when rpc approval is enabled", 
       ),
     },
   };
-  const context = ctx as unknown as ExtensionContext;
+  const context = ctx as unknown as ExtensionToolContext;
   host.start(context);
   t.after(() => host.stop());
   const run = () => tool.execute("t", { command: "true" }, undefined, undefined, context);

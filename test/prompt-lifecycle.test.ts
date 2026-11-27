@@ -398,7 +398,18 @@ test("RPC mode asks through select and confirm dialogs, never the widget", async
   assert.ok(Number.isInteger(confirm) && confirm <= select);
 
   const before = asked.length;
-  for (const mode of ["json", "print"]) assert.equal((await ask(mode)).action, "abort");
+  // Any non-TUI host with a UI gets the dialogs; without a UI nothing is asked.
+  for (const mode of ["json", "print"]) {
+    const headless = prompts.showPermissionPrompt(
+      f.pi,
+      { ...f.ctx, mode, hasUI: false, ui } as unknown as ExtensionContext,
+      "Blocked",
+      "example.com",
+      () => null,
+      0,
+    );
+    assert.equal((await headless).action, "abort");
+  }
   assert.equal(asked.length, before);
   assert.equal(f.mounts.length, 0);
 });

@@ -115,10 +115,9 @@ export async function showPermissionPrompt(
   timeoutSeconds?: number,
 ): Promise<PermissionPromptResult> {
   const aborted: PermissionPromptResult = { action: "abort", value: originalValue };
-  // TUI draws the inline widget; RPC clients get plain select/confirm dialogs.
-  if (!ctx.hasUI || (ctx.mode !== undefined && ctx.mode !== "tui" && ctx.mode !== "rpc")) {
-    return aborted;
-  }
+  // TUI draws the inline widget; other UI hosts (e.g. RPC clients) get plain
+  // select/confirm dialogs.
+  if (!ctx.hasUI) return aborted;
 
   const queue = getPromptQueue(pi);
   const operationSignal = ctx.signal;
@@ -143,26 +142,31 @@ export async function showPermissionPrompt(
     const ready = await Promise.race([previous.then(() => true), cancelled]);
     signal.removeEventListener("abort", onAbort);
     if (!ready || signal.aborted) return aborted;
-    if (ctx.mode === "rpc") {
-      return await dialogPermissionPrompt(
-        pi,
-        ctx,
-        title,
-        originalValue,
-        validateValue,
-        signal,
-        timeoutSeconds,
-      );
-    }
-    return await renderPermissionPrompt(
-      pi,
-      ctx,
-      title,
-      originalValue,
-      validateValue,
-      signal,
-      timeoutSeconds,
-    );
+    // Non-TUI hosts (e.g. rpc) can't mount the widget; fall back to dialogs.
+    const result =
+      ctx.mode !== undefined && ctx.mode !== "tui"
+        ? await dialogPermissionPrompt(
+            pi,
+            ctx,
+            title,
+            originalValue,
+            validateValue,
+            signal,
+            timeoutSeconds,
+          )
+        : await renderPermissionPrompt(
+            pi,
+            ctx,
+            title,
+            originalValue,
+            validateValue,
+            signal,
+            timeoutSeconds,
+          );
+    // Late or invalid answers grant nothing.
+    if (signal.aborted) return aborted;
+    if (result.action !== "abort" && validateValue(result.value) !== null) return aborted;
+    return result;
   } finally {
     signal.removeEventListener("abort", onAbort);
     release();
@@ -170,10 +174,10 @@ export async function showPermissionPrompt(
 }
 
 /**
- * RPC mode has no terminal, so the inline widget cannot render. The same
- * choices go through the client's select dialog; saving a rule to a config file
- * needs a second confirmation, as the TUI asks for Enter. The rule is the
- * blocked value itself (editing it needs the TUI).
+ * Non-TUI hosts (e.g. RPC) have no terminal, so the inline widget cannot
+ * render. The same choices go through the client's select dialog; saving a
+ * rule to a config file needs a second confirmation, as the TUI asks for Enter.
+ * The rule is the blocked value itself (editing it needs the TUI).
  */
 async function dialogPermissionPrompt(
   pi: ExtensionAPI,
@@ -586,7 +590,7 @@ export function promptWriteBlock(
 }
 
 export function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
-  if (!allowsAllDomains(config.network?.allowedDomains)) return;
+  if (config.network?.disabled || !allowsAllDomains(config.network?.allowedDomains)) return;
   ctx.ui.notify(
     '⚠️ Network sandbox allows all domains because network.allowedDomains contains "*". ' +
       'Only use this intentionally; remove "*" to restore per-domain prompts.',
@@ -623,9 +627,11 @@ export function warnIfLinuxUnenforcedGlobs(
 }
 
 export function formatSandboxStatus(config: SandboxConfig): string {
-  const networkLabel = allowsAllDomains(config.network?.allowedDomains)
-    ? "all domains"
-    : `${config.network?.allowedDomains?.length ?? 0} domains`;
+  const networkLabel = config.network?.disabled
+    ? "network disabled"
+    : allowsAllDomains(config.network?.allowedDomains)
+      ? "all domains"
+      : `${config.network?.allowedDomains?.length ?? 0} domains`;
   return `🔒 Sandbox: ${networkLabel}, ${config.filesystem?.allowWrite?.length ?? 0} write paths`;
 }
 
@@ -640,12 +646,18 @@ export function formatSandboxConfiguration(
     `  Global config:  ${paths.globalPath}`,
     "",
     "Network (bash + !cmd):",
-    `  Allowed domains: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
-    ...(allowsAllDomains(config.network?.allowedDomains)
-      ? ['  ⚠️ "*" allows all domains and disables per-domain prompts.']
-      : []),
-    `  Denied domains:  ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
-    ...(allowances.domains.length ? [`  Session allowed: ${allowances.domains.join(", ")}`] : []),
+    ...(config.network?.disabled
+      ? ["  Disabled (unrestricted network access)"]
+      : [
+          `  Allowed domains: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
+          ...(allowsAllDomains(config.network?.allowedDomains)
+            ? ['  ⚠️ "*" allows all domains and disables per-domain prompts.']
+            : []),
+          `  Denied domains:  ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
+          ...(allowances.domains.length
+            ? [`  Session allowed: ${allowances.domains.join(", ")}`]
+            : []),
+        ]),
     "",
     "Filesystem (bash + read/write/edit tools):",
     `  Deny Read:   ${config.filesystem?.denyRead?.join(", ") || "(none)"}`,

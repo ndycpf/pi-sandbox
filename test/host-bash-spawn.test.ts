@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -36,7 +36,7 @@ function fixture(t: TestContext, options: Partial<HostBashConfig> = {}) {
     hasUI: true,
     sessionManager: { getSessionId: () => "fixture" },
     ui: { select: async () => "Allow once" },
-  } as unknown as ExtensionContext;
+  } as unknown as ExtensionToolContext;
   host.start(ctx);
   t.after(() => host.stop());
   const run = async (command: string) => {

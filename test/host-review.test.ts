@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 
 import { execFile } from "node:child_process";
 import {
@@ -437,7 +437,7 @@ function fixture(t: TestContext, reviewer: Reviewer, mode: "tui" | "rpc" = "tui"
       notify: (text: string) => state.notes.push(text),
       setStatus: (_key: string, text?: string) => (state.status = text),
     },
-  } as unknown as ExtensionContext;
+  } as unknown as ExtensionToolContext;
   host.start(ctx);
   t.after(() => host.stop());
   const run = (command: string, reason?: string) =>
@@ -530,7 +530,7 @@ test("modelReviewer calls the configured model with Pi's credentials", async (t)
       ),
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }),
     },
-  } as unknown as ExtensionContext;
+  } as unknown as ExtensionToolContext;
   const target = `${model.provider}/${model.id}`;
   const verdict = await reviewCommand(
     modelReviewer(ctx, target),
@@ -735,7 +735,7 @@ test("modelReviewer runs read and ls calls before the answer", async (t) => {
       find: () => model,
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }),
     },
-  } as unknown as ExtensionContext;
+  } as unknown as ExtensionToolContext;
   const target = `${model.provider}/${model.id}`;
   const verdict = await reviewCommand(
     modelReviewer(ctx, target),
@@ -789,7 +789,7 @@ test("a rejected auto config is shown to the operator", (t) => {
       notify: (text: string) => notes.push(text),
       setStatus: (_key: string, text?: string) => (status = text),
     },
-  } as unknown as ExtensionContext;
+  } as unknown as ExtensionToolContext;
   host.start(ctx);
   t.after(() => host.stop());
   assert.equal(status, "host_bash: human (review config error)");

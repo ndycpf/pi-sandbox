@@ -3,8 +3,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { spawn } from "node:child_process";
 import { closeSync, constants, fstatSync, openSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { relative } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { DEFAULT_HOST_BASH_CONFIG, type HostBashConfig } from "./config.ts";
@@ -31,6 +32,15 @@ class HostCommandStopped extends Error {}
 
 const maxPromptLines = 32;
 const maxPromptChars = 2200;
+// Rows Pi's selector adds around the title: borders, spacers, two choices and the key hint.
+const selectorRows = 9;
+// Rows kept free below the selector for Pi's footer and status lines.
+const footerRows = 4;
+
+// Terminal rows the approval prompt needs, wrapped exactly as Pi's selector title is.
+export function promptRows(title: string, columns: number) {
+  return new Text(title, 1, 0).render(columns).length + selectorRows + footerRows;
+}
 
 async function approve(
   ctx: ExtensionContext,
@@ -54,16 +64,24 @@ async function approve(
   const shown = command.split("\n").map(quoted);
   const title = [...header, "Command (JSON-quoted lines): " + shown.join("\n")].join("\n");
   const lines = title.split("\n").length;
-  // The operator must be able to read the whole command, so an oversized one
-  // goes back to the agent instead of reaching the operator.
-  if (lines > maxPromptLines || title.length > maxPromptChars) {
+  const { rows, columns } = process.stdout;
+  const needed = rows && columns ? promptRows(title, columns) : Infinity;
+  // The operator must be able to read the whole command on one screen, so an
+  // oversized one goes back to the agent instead of reaching the operator.
+  if (lines > maxPromptLines || title.length > maxPromptChars || !rows || needed > rows) {
     const commandLines = maxPromptLines - header.length;
     const commandChars = maxPromptChars - (title.length - shown.join("\n").length);
+    const screen =
+      rows && columns
+        ? `With wrapping, the prompt needs ${needed} rows but the operator's terminal has ${rows} rows and ${columns} columns. `
+        : "The operator's terminal size is unknown. ";
     throw new ApprovalRefused(
       `Host command refused before prompting: command too long. ` +
         `As shown to the operator it is ${shown.length} lines and ${shown.join("\n").length} characters (JSON-quoted); ` +
-        `the limit for this call is ${commandLines} lines and ${commandChars} characters, so the operator could not read all of it. ` +
-        "Shorten the command and call again: split it into several bash_with_human_approval calls, " +
+        `the limit for this call is at most ${commandLines} lines and ${commandChars} characters, and the whole prompt must fit on the operator's screen. ` +
+        screen +
+        "The operator could not read all of it. " +
+        "Shorten the command (fewer and shorter lines) and call again: split it into several bash_with_human_approval calls, " +
         "remove comments and blank lines, or run the parts that do not need the host in ordinary sandboxed bash. " +
         "Do not move the logic into a script file to shorten it; the operator cannot review a file's contents in the prompt.",
     );
@@ -79,26 +97,39 @@ async function approve(
   return choice === "Allow once";
 }
 
-function within(parent: string, child: string) {
+export function within(parent: string, child: string) {
   const rel = relative(parent, child);
-  return rel === "" || (!rel.startsWith("..") && !rel.startsWith("/"));
+  return rel === "" || (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel));
 }
 
+// Canonical path, resolving symlinks through the nearest existing ancestor so
+// a missing entry is compared by where it would be created. Undefined if no
+// ancestor resolves.
 function resolved(path: string) {
-  try {
-    return realpathSync.native(path);
-  } catch {
-    return path;
+  let current = resolve(path);
+  const rest: string[] = [];
+  for (;;) {
+    try {
+      return join(realpathSync.native(current), ...rest);
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return undefined;
+      rest.unshift(basename(current));
+      current = parent;
+    }
   }
 }
 
 // System directories first so configured entries cannot shadow them. Entries in
 // the workspace or temp directories are dropped: sandboxed Bash can write there.
 export function hostPath(extraPath: readonly string[], cwd: string) {
-  const writable = [cwd, "/tmp", tmpdir()].map(resolved);
+  const writable = [cwd, "/tmp", tmpdir()]
+    .flatMap((dir) => [resolve(dir), resolved(dir)])
+    .filter((dir): dir is string => dir !== undefined);
   const extra = extraPath.filter((entry) => {
     const real = resolved(entry);
-    return !writable.some((dir) => within(dir, entry) || within(dir, real));
+    if (real === undefined) return false;
+    return !writable.some((dir) => within(dir, resolve(entry)) || within(dir, real));
   });
   return [systemPath, ...extra].join(":");
 }
@@ -167,7 +198,7 @@ export function registerUnsandboxBash(
       "Typical signs: 'Operation not permitted', 'Permission denied' outside the workspace, blocked network, 'command not found' for a tool installed on the host (docker, brew, gcloud), " +
       "an unreachable daemon or socket, or missing or invalid credentials (gh, git, cloud CLIs, keychain). " +
       "Every call prompts the operator, so do not use it for work the sandbox can do. " +
-      "Keep the command short and self-contained: a command over about 25 lines or 2,000 characters is refused without prompting and must be shortened or split. " +
+      "Keep the command short and self-contained: a command over about 25 lines or 2,000 characters, or one whose prompt does not fit the operator's terminal, is refused without prompting and must be shortened or split. " +
       "Runs non-interactively with stdin closed, a minimal PATH and environment, and a time limit. " +
       "Returns the exit status and, when enabled, the tail of combined stdout/stderr.",
     promptSnippet: "Ask the operator to run one Bash command outside the sandbox",

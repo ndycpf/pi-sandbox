@@ -1,12 +1,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import childProcess, { ChildProcess } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 
 import assert from "node:assert/strict";
 
@@ -16,7 +16,22 @@ import {
   mergeConfigLayers,
   resolveHostBashConfig,
 } from "../src/config.ts";
-import { hostPath, registerUnsandboxBash } from "../src/unsandbox-bash.ts";
+import { hostPath, promptRows, registerUnsandboxBash, within } from "../src/unsandbox-bash.ts";
+
+function fakeTerminal(t: TestContext, rows = 100, columns = 200) {
+  for (const [key, value] of [
+    ["rows", rows],
+    ["columns", columns],
+  ] as const) {
+    const previous = Object.getOwnPropertyDescriptor(process.stdout, key);
+    Object.defineProperty(process.stdout, key, { configurable: true, value });
+    t.after(() =>
+      previous
+        ? Object.defineProperty(process.stdout, key, previous)
+        : Reflect.deleteProperty(process.stdout, key),
+    );
+  }
+}
 
 test("bash_with_human_approval requires one current affirmative terminal approval", async (t) => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-approval-")));
@@ -30,6 +45,7 @@ test("bash_with_human_approval requires one current affirmative terminal approva
         : Reflect.deleteProperty(stream, "isTTY"),
     );
   }
+  fakeTerminal(t);
   let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
   const host = registerUnsandboxBash(
     {
@@ -130,7 +146,7 @@ test("bash_with_human_approval requires one current affirmative terminal approva
   const multiline = Array.from({ length: 27 }, (_, i) => `# line ${i}`).join("\n");
   await assert.rejects(
     run(undefined, multiline),
-    /refused before prompting: command too long\. As shown to the operator it is 27 lines .* the limit for this call is 26 lines/,
+    /refused before prompting: command too long\. As shown to the operator it is 27 lines .* the limit for this call is at most 26 lines/,
   );
   await assert.rejects(
     run(undefined, "# " + "x".repeat(2500)),
@@ -144,6 +160,27 @@ test("bash_with_human_approval requires one current affirmative terminal approva
   assert.ok(title.includes(JSON.stringify("# line 25")));
   choose("Deny");
   await assert.rejects(pending, /refused/);
+
+  // The rendered prompt must fit the operator's terminal, including wrapping.
+  const shortCommand = Array.from({ length: 12 }, (_, i) => `echo ${i}`).join("\n");
+  assert.ok(promptRows(shortCommand, 80) > 12);
+  Object.defineProperty(process.stdout, "rows", { configurable: true, value: 24 });
+  await assert.rejects(
+    run(undefined, shortCommand),
+    /command too long[\s\S]*needs \d+ rows but the operator's terminal has 24 rows/,
+  );
+  // About 1,900 characters wrap to more than 60 rows at 30 columns.
+  Object.defineProperty(process.stdout, "rows", { configurable: true, value: 60 });
+  Object.defineProperty(process.stdout, "columns", { configurable: true, value: 30 });
+  await assert.rejects(
+    run(undefined, "echo " + "y".repeat(1700)),
+    /terminal has 60 rows and 30 columns/,
+  );
+  Object.defineProperty(process.stdout, "columns", { configurable: true, value: undefined });
+  await assert.rejects(run(undefined, "true"), /terminal size is unknown/);
+  Object.defineProperty(process.stdout, "rows", { configurable: true, value: 100 });
+  Object.defineProperty(process.stdout, "columns", { configurable: true, value: 200 });
+  assert.equal(prompts, before + 1);
   assert.equal(launch.mock.callCount(), 1);
 });
 
@@ -171,6 +208,7 @@ test("bash_with_human_approval refuses when hostBash is disabled", async (t) => 
         : Reflect.deleteProperty(stream, "isTTY"),
     );
   }
+  fakeTerminal(t);
   host.start(ctx);
   t.after(() => host.stop());
   await assert.rejects(
@@ -219,6 +257,36 @@ test("hostBash config is global-only and validated", () => {
       homedir(),
     ],
   );
+});
+
+test("within treats names starting with .. as inside", () => {
+  assert.equal(within("/ws", "/ws/..tools/bin"), true);
+  assert.equal(within("/ws", "/ws"), true);
+  assert.equal(within("/ws", "/ws/../x"), false);
+  assert.equal(within("/ws", "/other"), false);
+});
+
+test("hostPath resolves missing entries through their nearest existing ancestor", () => {
+  const base = realpathSync(mkdtempSync(join(homedir(), ".pi-host-path-")));
+  try {
+    const ws = join(base, "real", "ws");
+    mkdirSync(ws, { recursive: true });
+    symlinkSync(join(base, "real"), join(base, "alias"));
+    assert.equal(
+      hostPath(
+        [
+          join(base, "alias", "ws", "missing-bin"),
+          join(base, "alias", "ws"),
+          join(ws, "..tools", "bin"),
+          join(base, "outside", "bin"),
+        ],
+        ws,
+      ),
+      "/usr/bin:/bin:" + join(base, "outside", "bin"),
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });
 
 test("hostPath keeps system directories first and drops sandbox-writable entries", () => {

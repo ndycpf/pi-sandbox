@@ -203,7 +203,8 @@ interactive Linux/macOS CLI shows the time limit, how much output the agent
 will see, the shell, PATH, resolved working directory and JSON-quoted command
 lines in Pi's standard selector. **Deny** is selected first. **Allow once** runs
 the command once. A command whose prompt would exceed 32 lines or 2,200
-characters (about 25 command lines) never reaches you: the agent gets a "command
+characters (about 25 command lines), or would not fit your terminal window once
+wrapped, never reaches you: the agent gets a "command
 too long" error with the limit and is asked to shorten or split it, so you never
 approve text you could not see. Escape cancels. RPC, print, JSON and non-TTY sessions cannot approve.
 

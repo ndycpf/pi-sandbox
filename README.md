@@ -259,10 +259,11 @@ like the rest of `hostBash`, can only be turned on in the global config:
     "review": {
       // "human" (default) prompts for every call. "auto" asks the reviewer first.
       "mode": "auto",
-      // Any model Pi can use, as "provider/model-id". Required for "auto";
-      // without it every call is prompted. Pi's own credentials are used.
+      // Any model Pi can use, as "provider/model-id". Required for "auto".
+      // Pi's own credentials are used.
       "model": "anthropic/claude-haiku-4-5",
-      // Optional: absolute path to extra policy text appended to the built-in one.
+      // Optional: extra policy text appended to the built-in one, as an
+      // absolute path or one starting with ~/.
       "policyFile": "/Users/me/.pi/agent/host-review-policy.md",
       // Limit for one review, including its file checks (5-180, default 60);
       // on expiry you are prompted.
@@ -284,7 +285,8 @@ probing, security weakening, destructive actions), with your `policyFile`
 in Codex's extra-policy slot. Its user message has:
 
 - the session transcript as JSON records: your messages, the agent's text and
-  tool calls, and tool results (reasoning is left out). Like Codex, your
+  tool calls, and tool results (reasoning is left out, and so are `!!`
+  commands, which Pi keeps out of model requests). Like Codex, your
   messages are kept first, then the 40 most recent other entries, within
   token budgets; long entries are cut in the middle with a `<truncated ... />`
   marker. Only your messages count as trusted authorization;
@@ -296,10 +298,14 @@ Like Codex's reviewer, it can check local state before deciding, but only with
 two read-only tools: `read` (up to 16 KiB of a text file, with a line offset)
 and `ls` (up to 200 entries). It may read only what the agent's sandbox can
 read (the same `denyRead`/`allowRead` rules, after resolving symlinks), and
-never secret files even where the sandbox could: `~/.ssh`, `~/.gnupg`,
-`~/.aws`, `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/gcloud`,
-keychains, `.env*`, `*.pem`/`*.key` and similar, `id_*`, `.netrc`, `.npmrc`,
-credentials files. A review gets at most 8 tool calls and 64 KiB of tool
+never secret files even where the sandbox could: every `credentials.files`
+path in your sandbox config (masked or denied), `/proc`, `/sys`, `/dev`,
+`~/.pi/agent/auth.json`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`,
+`~/.docker`, `~/.config/gh`, `~/.config/gcloud`, keychains, `.env*`,
+`*.pem`/`*.key` and similar, `id_*`, `.netrc`, `.npmrc`, credentials files.
+Each check opens the file first, applies these rules to the path it resolves
+to, and reads only if that path still names the opened file, so a symlink
+swapped mid-check is refused. A review gets at most 8 tool calls and 64 KiB of tool
 output. The prompt tells it to look only when the result could change its
 decision (for example the target of an `rm -rf` or a script a command runs) and
 that what it reads is untrusted evidence. Its checks are listed in the review
@@ -321,7 +327,9 @@ It answers with Codex's JSON contract (`outcome` `allow`/`deny`, `risk_level`,
   the rest of the session and every call is prompted.
 
 Auto-review is turned on and off only in the global config; restart Pi after
-changing it.
+changing it. An `"auto"` config with a bad `model` or `policyFile` is not used:
+every call is prompted, and Pi shows the error at session start and
+`host_bash: human (review config error)` in the status bar.
 
 Some commands always come to you whatever the reviewer would say: `sudo` and
 similar, `rm` with `-r` or `-f`, piping into a shell, disk-level tools, paths

@@ -216,6 +216,8 @@ export function registerHostBash(
     | undefined;
   const showStatus = (ctx: ExtensionContext) => {
     const review = config(ctx.cwd).review;
+    if (review.error)
+      return ctx.ui?.setStatus?.("host-bash", "host_bash: human (review config error)");
     if (review.mode !== "auto") return ctx.ui?.setStatus?.("host-bash", undefined);
     ctx.ui?.setStatus?.(
       "host-bash",
@@ -488,6 +490,12 @@ export function registerHostBash(
         ? { manager: ctx.sessionManager, id, lifetime: new AbortController(), denials: 0 }
         : undefined;
       showStatus(ctx);
+      const error = config(ctx.cwd).review.error;
+      if (error)
+        ctx.ui?.notify?.(
+          `host_bash auto-review is off: ${error}. Every call is prompted.`,
+          "warning",
+        );
     },
     stop() {
       session?.lifetime.abort();

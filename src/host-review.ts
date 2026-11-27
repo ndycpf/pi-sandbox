@@ -2,6 +2,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, isAbsolute } from "node:path";
 
 import { completeSimple } from "@earendil-works/pi-ai/compat";
@@ -25,6 +26,8 @@ export type HostReviewConfig = {
   timeoutSeconds: number;
   /** The review log: JSON lines, rotated by size, with a fixed number of files kept. */
   log: ReviewLogConfig;
+  /** Why an "auto" config was rejected; review then stays "human". */
+  error?: string;
 };
 
 export type ReviewLogConfig = {
@@ -70,7 +73,7 @@ export function resolveHostReviewConfig(value: unknown): HostReviewConfig {
   const model =
     typeof raw.model === "string" && /^[^/\s]+\/\S+$/.test(raw.model) ? raw.model : undefined;
   const policyFile =
-    typeof raw.policyFile === "string" && isAbsolute(raw.policyFile) ? raw.policyFile : undefined;
+    typeof raw.policyFile === "string" ? raw.policyFile.replace(/^~(?=\/)/, homedir()) : undefined;
   const timeoutSeconds =
     Number.isInteger(raw.timeoutSeconds) &&
     (raw.timeoutSeconds as number) >= 5 &&
@@ -78,7 +81,15 @@ export function resolveHostReviewConfig(value: unknown): HostReviewConfig {
       ? (raw.timeoutSeconds as number)
       : DEFAULT_HOST_REVIEW_CONFIG.timeoutSeconds;
   const log = resolveReviewLogConfig(raw.log);
-  if (raw.mode !== "auto" || !model) return { mode: "human", timeoutSeconds, log };
+  if (raw.mode !== "auto") return { mode: "human", timeoutSeconds, log };
+  // An "auto" config the operator got wrong must not run with less than they
+  // configured: it falls back to human review and says why.
+  const error = !model
+    ? 'hostBash.review.model must be "provider/model-id"'
+    : raw.policyFile !== undefined && !(policyFile && isAbsolute(policyFile))
+      ? "hostBash.review.policyFile must be an absolute path or start with ~/"
+      : undefined;
+  if (error) return { mode: "human", timeoutSeconds, log, error };
   return { mode: "auto", model, ...(policyFile && { policyFile }), timeoutSeconds, log };
 }
 
@@ -215,7 +226,8 @@ function entriesOf(branch: unknown[]): Entry[] {
         label: `tool_result ${String(message.toolName)}${message.isError ? " (error)" : ""}`,
         text: textOf(message.content),
       });
-    } else if (message.role === "bashExecution") {
+    } else if (message.role === "bashExecution" && message.excludeFromContext !== true) {
+      // `!!` commands are kept out of model requests, so out of reviews too.
       // The operator's own `!` command; its output is still untrusted.
       entries.push({
         author: "tool",

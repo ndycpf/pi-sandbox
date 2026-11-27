@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import {
+import fs, {
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -10,7 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 
@@ -83,7 +83,6 @@ test("review config defaults to human and needs an explicit model for auto", () 
     resolveHostReviewConfig({
       mode: "auto",
       model: "openrouter/anthropic/claude",
-      policyFile: "relative.md",
       timeoutSeconds: 1,
     }),
     {
@@ -92,6 +91,21 @@ test("review config defaults to human and needs an explicit model for auto", () 
       timeoutSeconds: 60,
       log: DEFAULT_REVIEW_LOG_CONFIG,
     },
+  );
+  // A policy file the operator set but that cannot be used turns auto off, with a reason.
+  for (const policyFile of ["relative.md", "~user/p.md", 42]) {
+    const resolved = resolveHostReviewConfig({ mode: "auto", model: "a/b", policyFile });
+    assert.equal(resolved.mode, "human");
+    assert.match(resolved.error ?? "", /policyFile must be an absolute path/);
+  }
+  assert.match(
+    resolveHostReviewConfig({ mode: "auto", model: "no-slash" }).error ?? "",
+    /model must be/,
+  );
+  assert.equal(resolveHostReviewConfig({ mode: "human", policyFile: "x" }).error, undefined);
+  assert.equal(
+    resolveHostReviewConfig({ mode: "auto", model: "a/b", policyFile: "~/p.md" }).policyFile,
+    join(homedir(), "p.md"),
   );
   assert.equal(
     resolveHostReviewConfig({ mode: "auto", model: "a/b", policyFile: "/p.md" }).policyFile,
@@ -273,6 +287,19 @@ test("transcript records follow Codex's sync profile", () => {
       },
     },
     { type: "compaction", summary: "s" },
+    {
+      type: "message",
+      message: {
+        role: "bashExecution",
+        command: "cat secret",
+        output: "s3cr3t",
+        excludeFromContext: true,
+      },
+    },
+    {
+      type: "message",
+      message: { role: "bashExecution", command: "git log -1", output: "abc" },
+    },
     { type: "message", message: { role: "user", content: [{ type: "text", text: "second" }] } },
   ];
   const records = transcriptRecords(branch).map((line) => JSON.parse(line));
@@ -286,7 +313,8 @@ test("transcript records follow Codex's sync profile", () => {
       text: '{"name":"bash","arguments":{"command":"git status"}}',
     },
     { author: "tool", index: 4, label: "tool_result bash (error)", text: "denied" },
-    { author: "user", index: 5, text: "second" },
+    { author: "tool", index: 5, label: "operator_shell_command", text: "$ git log -1\nabc" },
+    { author: "user", index: 6, text: "second" },
   ]);
   // Long tool output is cut in the middle; old non-user entries drop out first.
   const many = [
@@ -625,4 +653,64 @@ test("auto-review works for an RPC client without a TTY", { skip: !supported }, 
   verdict = { outcome: "deny", rationale: "no" };
   await assert.rejects(run("true"), /denied by the automatic reviewer: no/);
   assert.equal(state.prompts, 1);
+});
+
+test("reviewer reads refuse credential files, process state and swapped paths", (t) => {
+  const work = realpathSync(mkdtempSync(join(tmpdir(), "pi-review-guard-")));
+  t.after(() => rmSync(work, { recursive: true, force: true }));
+  writeFileSync(join(work, "token.json"), '{"token":"real"}');
+  writeFileSync(join(work, "plain.txt"), "plain");
+  writeFileSync(join(work, "other.txt"), "other");
+  const policy = { denyRead: [], allowRead: [], credentialFiles: ["token.json"] };
+  const tools = new ReviewToolRunner(work, policy);
+  assert.deepEqual(tools.run("read", { path: "token.json" }), {
+    text: "Refused: credential file in the sandbox's credentials config.",
+    isError: true,
+  });
+  if (process.platform === "linux") {
+    assert.deepEqual(tools.run("read", { path: "/proc/self/environ" }), {
+      text: "Refused: secret file.",
+      isError: true,
+    });
+  }
+  // A path that resolves to a different object than the one opened is refused.
+  const real = fs.realpathSync.native;
+  const swap = t.mock.method(fs.realpathSync, "native", (path: string) =>
+    path.endsWith("plain.txt") ? join(work, "other.txt") : real(path),
+  );
+  assert.deepEqual(tools.run("read", { path: "plain.txt" }), {
+    text: "Refused: the path changed while it was checked.",
+    isError: true,
+  });
+  swap.mock.restore();
+  assert.deepEqual(tools.run("read", { path: "plain.txt" }), { text: "plain", isError: false });
+  assert.deepEqual(tools.run("ls", { path: "plain.txt" }), {
+    text: "Not a directory.",
+    isError: true,
+  });
+});
+
+test("a rejected auto config is shown to the operator", (t) => {
+  let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
+  const review = resolveHostReviewConfig({ mode: "auto", model: "a/b", policyFile: "rel.md" });
+  const host = registerHostBash(
+    { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,
+    () => true,
+    () => ({ ...DEFAULT_HOST_BASH_CONFIG, enabled: true, review }),
+  );
+  const notes: string[] = [];
+  let status: string | undefined;
+  const ctx = {
+    cwd: process.cwd(),
+    sessionManager: { getSessionId: () => "fixture" },
+    ui: {
+      notify: (text: string) => notes.push(text),
+      setStatus: (_key: string, text?: string) => (status = text),
+    },
+  } as unknown as ExtensionContext;
+  host.start(ctx);
+  t.after(() => host.stop());
+  assert.equal(status, "host_bash: human (review config error)");
+  assert.match(notes[0] ?? "", /auto-review is off: hostBash.review.policyFile must be/);
+  assert.ok(tool);
 });

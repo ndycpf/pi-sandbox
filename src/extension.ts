@@ -490,6 +490,8 @@ export default function (pi: ExtensionAPI) {
           readPolicy: (cwd) => ({
             denyRead: loadConfig(cwd, projectTrusted).filesystem?.denyRead ?? [],
             allowRead: effectiveReadPaths(cwd),
+            credentialFiles:
+              loadConfig(cwd, projectTrusted).credentials?.files?.map((file) => file.path) ?? [],
           }),
         },
       );

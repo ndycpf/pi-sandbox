@@ -1,3 +1,4 @@
+import type { Message } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
@@ -6,6 +7,12 @@ import { dirname, isAbsolute } from "node:path";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 
 import { reviewInstructions, reviewRequest } from "./host-review-prompt.ts";
+import {
+  maxToolCalls,
+  type ReadPolicy,
+  ReviewToolRunner,
+  reviewTools,
+} from "./host-review-tools.ts";
 
 export type HostReviewConfig = {
   /** "human" prompts for every call; "auto" asks an LLM reviewer first. */
@@ -18,7 +25,7 @@ export type HostReviewConfig = {
   timeoutSeconds: number;
 };
 
-export const DEFAULT_HOST_REVIEW_CONFIG: HostReviewConfig = { mode: "human", timeoutSeconds: 30 };
+export const DEFAULT_HOST_REVIEW_CONFIG: HostReviewConfig = { mode: "human", timeoutSeconds: 60 };
 
 /** Validate a global `hostBash.review` entry. Anything invalid means human review. */
 export function resolveHostReviewConfig(value: unknown): HostReviewConfig {
@@ -30,7 +37,7 @@ export function resolveHostReviewConfig(value: unknown): HostReviewConfig {
   const timeoutSeconds =
     Number.isInteger(raw.timeoutSeconds) &&
     (raw.timeoutSeconds as number) >= 5 &&
-    (raw.timeoutSeconds as number) <= 120
+    (raw.timeoutSeconds as number) <= 180
       ? (raw.timeoutSeconds as number)
       : DEFAULT_HOST_REVIEW_CONFIG.timeoutSeconds;
   if (raw.mode !== "auto" || !model) return { ...DEFAULT_HOST_REVIEW_CONFIG, timeoutSeconds };
@@ -63,10 +70,20 @@ export type Verdict = {
   risk?: Assessment["risk_level"];
   authorization?: Assessment["user_authorization"];
   reason: string;
+  /** The reviewer's read and ls calls. */
+  checks?: ReviewToolRunner["history"];
 };
 
-/** Calls the reviewer model with a system prompt and one user message; returns its text. */
-export type Reviewer = (system: string, user: string, signal: AbortSignal) => Promise<string>;
+/**
+ * Calls the reviewer model with a system prompt and one user message, letting
+ * it use `tools` (read and ls) until it answers; returns its final text.
+ */
+export type Reviewer = (
+  system: string,
+  user: string,
+  signal: AbortSignal,
+  tools: ReviewToolRunner,
+) => Promise<string>;
 
 // Commands that always go to the operator, whatever the reviewer says. These
 // patterns are a coarse speed bump, not a boundary: a determined agent can
@@ -287,6 +304,7 @@ export async function reviewCommand(
   config: HostReviewConfig,
   action: PlannedAction,
   records: string[],
+  policy: ReadPolicy,
   cancel: AbortSignal,
 ): Promise<Verdict> {
   const forced = alwaysAskReason(action.command.at(-1) ?? "");
@@ -298,10 +316,12 @@ export async function reviewCommand(
     signal.addEventListener("abort", stop, { once: true });
   });
   aborted.catch(() => {});
+  const tools = new ReviewToolRunner(action.cwd, policy);
+  const checks = () => (tools.history.length ? { checks: tools.history } : {});
   try {
     const system = reviewSystemPrompt(config);
     const text = await Promise.race([
-      reviewer(system, reviewRequest(records, action), signal),
+      reviewer(system, reviewRequest(records, action), signal, tools),
       aborted,
     ]);
     signal.throwIfAborted();
@@ -311,10 +331,18 @@ export async function reviewCommand(
       risk: assessment.risk_level,
       authorization: assessment.user_authorization,
       reason: assessment.rationale,
+      ...checks(),
     };
-    // Codex may allow a high-risk action the user authorized. Here, with no
-    // read-only checks behind the review, the operator confirms those.
-    if (verdict.decision === "allow" && (verdict.risk === "high" || verdict.risk === "critical")) {
+    // Codex's thresholds, enforced here too: a high-risk allow needs at least
+    // medium user authorization, and critical is never allowed. An allow that
+    // breaks them goes to the operator.
+    if (
+      verdict.decision === "allow" &&
+      (verdict.risk === "critical" ||
+        (verdict.risk === "high" &&
+          verdict.authorization !== "medium" &&
+          verdict.authorization !== "high"))
+    ) {
       return { ...verdict, decision: "ask" };
     }
     return verdict;
@@ -323,7 +351,7 @@ export async function reviewCommand(
     const why = signal.aborted
       ? `review timed out after ${config.timeoutSeconds}s`
       : `review failed (${error instanceof Error ? error.message : String(error)})`;
-    return { decision: "ask", reason: `Auto-review unavailable: ${why}.` };
+    return { decision: "ask", reason: `Auto-review unavailable: ${why}.`, ...checks() };
   } finally {
     if (stop) signal.removeEventListener("abort", stop);
   }
@@ -331,34 +359,54 @@ export async function reviewCommand(
 
 /** A reviewer backed by a model from Pi's registry, using Pi's own credentials. */
 export function modelReviewer(ctx: ExtensionContext, target: string): Reviewer {
-  return async (system, user, signal) => {
+  return async (system, user, signal, tools) => {
     const slash = target.indexOf("/");
     const model = ctx.modelRegistry.find(target.slice(0, slash), target.slice(slash + 1));
     if (!model) throw new Error(`model ${target} not found`);
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (!auth.ok) throw new Error(auth.error);
-    const response = await completeSimple(
-      model,
-      {
-        systemPrompt: system,
-        messages: [
-          { role: "user", content: [{ type: "text", text: user }], timestamp: Date.now() },
-        ],
-      },
-      {
-        apiKey: auth.apiKey,
-        headers: auth.headers,
-        env: auth.env,
-        signal,
-        maxTokens: 1024,
-        maxRetries: 1,
-      },
-    );
-    if (response.stopReason !== "stop") throw new Error(`model stopped: ${response.stopReason}`);
-    return response.content
-      .filter((part): part is { type: "text"; text: string } => part.type === "text")
-      .map((part) => part.text)
-      .join("");
+    const messages: Message[] = [
+      { role: "user", content: [{ type: "text", text: user }], timestamp: Date.now() },
+    ];
+    // Each turn either answers or makes tool calls; past the budget every call
+    // is refused, and a reviewer that still will not answer fails the review.
+    for (let turn = 0; turn <= maxToolCalls + 1; turn++) {
+      const response = await completeSimple(
+        model,
+        { systemPrompt: system, messages, tools: reviewTools },
+        {
+          apiKey: auth.apiKey,
+          headers: auth.headers,
+          env: auth.env,
+          signal,
+          maxTokens: 2048,
+          maxRetries: 1,
+        },
+      );
+      const calls = response.content.filter((part) => part.type === "toolCall");
+      if (response.stopReason === "stop" && !calls.length) {
+        return response.content
+          .filter((part): part is { type: "text"; text: string } => part.type === "text")
+          .map((part) => part.text)
+          .join("");
+      }
+      if (response.stopReason !== "toolUse" || !calls.length)
+        throw new Error(`model stopped: ${response.stopReason}`);
+      messages.push(response);
+      for (const call of calls) {
+        signal.throwIfAborted();
+        const result = tools.run(call.name, call.arguments ?? {});
+        messages.push({
+          role: "toolResult",
+          toolCallId: call.id,
+          toolName: call.name,
+          content: [{ type: "text", text: result.text }],
+          isError: result.isError,
+          timestamp: Date.now(),
+        });
+      }
+    }
+    throw new Error("reviewer did not answer within its tool budget");
   };
 }
 

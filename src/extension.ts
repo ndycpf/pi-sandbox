@@ -485,6 +485,13 @@ export default function (pi: ExtensionAPI) {
         () => sandboxEnabled && sandboxInitialized,
         // hostBash is global-only, so project trust does not change it.
         (cwd) => resolveHostBashConfig(loadConfig(cwd, false).hostBash),
+        {
+          // The auto-reviewer may read what the sandbox may read, no more.
+          readPolicy: (cwd) => ({
+            denyRead: loadConfig(cwd, projectTrusted).filesystem?.denyRead ?? [],
+            allowRead: effectiveReadPaths(cwd),
+          }),
+        },
       );
     }
     if (pi.getFlag("no-sandbox") as boolean) {

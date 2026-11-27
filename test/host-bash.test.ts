@@ -197,7 +197,7 @@ test("hostBash config is global-only and validated", () => {
     enabled: true,
     timeoutSeconds: 60,
     outputBytes: 16384,
-    review: { mode: "human", timeoutSeconds: 30 },
+    review: { mode: "human", timeoutSeconds: 60 },
   });
   // A project file cannot turn on auto-review either.
   assert.equal(

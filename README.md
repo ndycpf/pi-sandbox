@@ -247,8 +247,9 @@ like the rest of `hostBash`, can only be turned on in the global config:
       "model": "anthropic/claude-haiku-4-5",
       // Optional: absolute path to extra policy text appended to the built-in one.
       "policyFile": "/Users/me/.pi/agent/host-review-policy.md",
-      // Limit for one review (5-120, default 30); on expiry you are prompted.
-      "timeoutSeconds": 30
+      // Limit for one review, including its file checks (5-180, default 60);
+      // on expiry you are prompted.
+      "timeoutSeconds": 60
     }
   }
 }
@@ -270,13 +271,26 @@ in Codex's extra-policy slot. Its user message has:
   agent's one-line `reason` as `justification`, `PATH` and `HOME`, the time
   limit and how much output the agent will see.
 
+Like Codex's reviewer, it can check local state before deciding, but only with
+two read-only tools: `read` (up to 16 KiB of a text file, with a line offset)
+and `ls` (up to 200 entries). It may read only what the agent's sandbox can
+read (the same `denyRead`/`allowRead` rules, after resolving symlinks), and
+never secret files even where the sandbox could: `~/.ssh`, `~/.gnupg`,
+`~/.aws`, `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/gcloud`,
+keychains, `.env*`, `*.pem`/`*.key` and similar, `id_*`, `.netrc`, `.npmrc`,
+credentials files. A review gets at most 8 tool calls and 64 KiB of tool
+output. The prompt tells it to look only when the result could change its
+decision (for example the target of an `rm -rf` or a script a command runs) and
+that what it reads is untrusted evidence. Its checks are listed in the review
+log.
+
 It answers with Codex's JSON contract (`outcome` `allow`/`deny`, `risk_level`,
 `user_authorization`, `rationale`):
 
 - **allow** runs the command without a prompt. It is the only answer that does.
-  Unlike Codex, which can allow a `high`-risk action the user authorized, an
-  allow rated `high` or `critical` shows you the prompt, because this reviewer
-  cannot run read-only checks first.
+  Codex's thresholds are also enforced outside the model: an allow rated `high`
+  needs `user_authorization` `medium` or `high`, and an allow rated `critical`
+  never runs. An allow that breaks them shows you the prompt.
 - An error, a timeout, a missing model or credentials, or an answer without a
   valid `outcome` shows you the normal prompt.
 - **deny** returns the rationale to the agent with Codex's rejection
@@ -302,16 +316,16 @@ approval, because it can fall back to you. The status bar shows
 notification, and every review is appended to
 `~/.pi/agent/host-bash-review.log` (JSON lines, rotated to `.1` at 1 MiB).
 
-**What auto-review cannot catch.** The reviewer sees text, not the machine. It
-cannot see the contents of files a command runs or reads, so a harmless-looking
-`make test` or `git commit` can run code the agent wrote earlier in the
-workspace, unless that code shows up in the transcript; unlike Codex's
-reviewer, it cannot read files to check. Text in the command, the agent's
-reason, tool output or your pasted messages can try to talk it into `allow`
-(prompt injection). It can misjudge what a command does, especially an
+**What auto-review cannot catch.** The reviewer can read files, but it may not
+look, and it cannot follow everything a command touches: a harmless-looking
+`make test` or `git commit` can run code several files deep, from paths it
+cannot read, or fetched at run time. Text in the command, the agent's reason,
+tool output, files it reads (which the agent may have written) or your pasted
+messages can try to talk it into `allow` (prompt injection). It can misjudge what a command does, especially an
 unusual or obfuscated one. Commands it allows run with your full user rights,
-and each review sends the command, working directory, `PATH` and the session
-transcript (up to roughly 30k tokens) to the model provider you configured. Use auto-review for convenience
+and each review sends the command, working directory, `PATH`, the session
+transcript (up to roughly 30k tokens) and the files it reads to the model
+provider you configured. Use auto-review for convenience
 on a machine and model you trust, not as a security boundary; keep `mode:
 "human"` where a wrong `allow` would be costly.
 

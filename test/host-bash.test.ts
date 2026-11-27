@@ -84,9 +84,9 @@ test("host_bash requires one current affirmative terminal approval", async (t) =
   const command = "printf x >> proof";
   const run = (signal?: AbortSignal, text = command) =>
     tool.execute("test", { command: text }, signal, undefined, context);
-  for (const mode of ["rpc", "print", "json"]) {
+  for (const mode of ["print", "json"]) {
     ctx.mode = mode;
-    await assert.rejects(run(), /refused/);
+    await assert.rejects(run(), new RegExp(`mode "${mode}"\\) cannot show the operator`));
   }
   ctx.mode = "tui";
   Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
@@ -193,7 +193,12 @@ test("hostBash config is global-only and validated", () => {
     { hostBash: { enabled: true } },
     { hostBash: { enabled: false, timeoutSeconds: 3000 } },
   );
-  assert.deepEqual(merged.hostBash, { enabled: true, timeoutSeconds: 60, outputBytes: 16384 });
+  assert.deepEqual(merged.hostBash, {
+    enabled: true,
+    timeoutSeconds: 60,
+    outputBytes: 16384,
+    approvalModes: ["tui", "rpc"],
+  });
   assert.equal(
     mergeConfigLayers(DEFAULT_CONFIG, {}, { hostBash: { enabled: true } }).hostBash?.enabled,
     false,
@@ -203,6 +208,73 @@ test("hostBash config is global-only and validated", () => {
     DEFAULT_HOST_BASH_CONFIG,
   );
   assert.equal(resolveHostBashConfig({ timeoutSeconds: 600, outputBytes: 0 }).outputBytes, 0);
+  assert.deepEqual(resolveHostBashConfig({ approvalModes: ["rpc", "json", "rpc"] }).approvalModes, [
+    "rpc",
+  ]);
+  assert.deepEqual(resolveHostBashConfig({ approvalModes: [] }).approvalModes, []);
+  assert.deepEqual(resolveHostBashConfig({ approvalModes: "tui" }).approvalModes, ["tui", "rpc"]);
+});
+
+test("host_bash asks an RPC client without a TTY when rpc approval is enabled", async (t) => {
+  let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
+  let modes: ("tui" | "rpc")[] = ["tui", "rpc"];
+  const host = registerHostBash(
+    { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,
+    () => true,
+    () => ({ ...DEFAULT_HOST_BASH_CONFIG, enabled: true, approvalModes: modes }),
+  );
+  for (const stream of [process.stdin, process.stdout]) {
+    const previous = Object.getOwnPropertyDescriptor(stream, "isTTY");
+    Object.defineProperty(stream, "isTTY", { configurable: true, value: false });
+    t.after(() =>
+      previous
+        ? Object.defineProperty(stream, "isTTY", previous)
+        : Reflect.deleteProperty(stream, "isTTY"),
+    );
+  }
+  const launch = t.mock.method(childProcess, "spawn", () => {
+    const child = new ChildProcess();
+    const report = new PassThrough();
+    Object.defineProperty(child, "stdio", { value: [null, null, null, report] });
+    queueMicrotask(() => {
+      child.emit("spawn");
+      report.end("ok");
+      child.emit("exit", 0);
+    });
+    return child;
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    launch.mock.restore();
+    syncBuiltinESMExports();
+  });
+  let prompts = 0;
+  let answer: string | undefined = "Allow once";
+  const ctx = {
+    cwd: process.cwd(),
+    mode: "rpc",
+    hasUI: true,
+    sessionManager: { getSessionId: () => "fixture" },
+    ui: { select: async () => (prompts++, answer) },
+  };
+  const context = ctx as unknown as ExtensionContext;
+  host.start(context);
+  t.after(() => host.stop());
+  const run = () => tool.execute("t", { command: "true" }, undefined, undefined, context);
+  assert.deepEqual((await run()).details, { exitCode: 0 });
+  for (answer of [undefined, "Deny", "allow once"]) await assert.rejects(run(), /refused/);
+  assert.equal(prompts, 4);
+  assert.equal(launch.mock.callCount(), 1);
+  // A TUI without a terminal still cannot approve.
+  ctx.mode = "tui";
+  await assert.rejects(run(), /mode "tui"\) cannot show the operator/);
+  ctx.mode = "rpc";
+  ctx.hasUI = false;
+  await assert.rejects(run(), /mode "rpc"\) cannot show the operator/);
+  ctx.hasUI = true;
+  modes = ["tui"];
+  await assert.rejects(run(), /approvalModes does not include "rpc"/);
+  assert.equal(prompts, 4);
 });
 
 test("hostPath inherits Pi's PATH", (t) => {

@@ -338,3 +338,54 @@ test("UI failures release the queue without granting permission", { timeout: 200
   f.send("s");
   assert.equal((await b).action, "session");
 });
+
+test("RPC mode asks through select and confirm dialogs, never the widget", async (t) => {
+  const f = fixture(t);
+  const asked: { kind: string; title: string; options?: string[] }[] = [];
+  let answers: (string | boolean | undefined)[] = [];
+  const ui = {
+    ...f.ctx.ui,
+    select: async (title: string, options: string[]) => {
+      asked.push({ kind: "select", title, options });
+      return answers.shift() as string | undefined;
+    },
+    confirm: async (title: string) => {
+      asked.push({ kind: "confirm", title });
+      return answers.shift() as boolean;
+    },
+  };
+  const ask = (mode: string, valid = true) =>
+    prompts.showPermissionPrompt(
+      f.pi,
+      { ...f.ctx, mode, ui } as unknown as ExtensionContext,
+      "Blocked",
+      "example.com",
+      () => (valid ? null : "bad"),
+      0,
+    );
+  const labels = prompts
+    .permissionOptions("/workspace")
+    .map((o) => (o.hint ? `${o.label} ${o.hint}` : o.label));
+
+  answers = [labels[0]];
+  assert.deepEqual(await ask("rpc"), { action: "session", value: "example.com" });
+  assert.deepEqual(asked[0], { kind: "select", title: "Blocked", options: labels });
+
+  answers = [labels[2], false];
+  assert.equal((await ask("rpc")).action, "abort");
+  answers = [labels[3], true];
+  assert.deepEqual(await ask("rpc"), { action: "global", value: "example.com" });
+  assert.equal(asked.filter((a) => a.kind === "confirm").length, 2);
+
+  for (const answer of [undefined, labels[1], "Allow everything"]) {
+    answers = [answer];
+    assert.equal((await ask("rpc")).action, "abort");
+  }
+  answers = [labels[0]];
+  assert.equal((await ask("rpc", false)).action, "abort");
+
+  const before = asked.length;
+  for (const mode of ["json", "print"]) assert.equal((await ask(mode)).action, "abort");
+  assert.equal(asked.length, before);
+  assert.equal(f.mounts.length, 0);
+});

@@ -10,7 +10,7 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { reviewInstructions, reviewRequest } from "./host-review-prompt.ts";
 import {
   maxToolCalls,
-  type ReadPolicy,
+  type ReviewExec,
   ReviewToolRunner,
   reviewTools,
 } from "./host-review-tools.ts";
@@ -354,7 +354,7 @@ export async function reviewCommand(
   config: HostReviewConfig,
   action: PlannedAction,
   records: string[],
-  policy: ReadPolicy,
+  exec: ReviewExec | undefined,
   cancel: AbortSignal,
 ): Promise<Verdict> {
   const forced = alwaysAskReason(action.command.at(-1) ?? "");
@@ -366,7 +366,7 @@ export async function reviewCommand(
     signal.addEventListener("abort", stop, { once: true });
   });
   aborted.catch(() => {});
-  const tools = new ReviewToolRunner(action.cwd, policy);
+  const tools = new ReviewToolRunner(action.cwd, exec);
   const checks = () => (tools.history.length ? { checks: tools.history } : {});
   try {
     const system = reviewSystemPrompt(config);
@@ -445,7 +445,7 @@ export function modelReviewer(ctx: ExtensionContext, target: string): Reviewer {
       messages.push(response);
       for (const call of calls) {
         signal.throwIfAborted();
-        const result = tools.run(call.name, call.arguments ?? {});
+        const result = await tools.run(call.name, call.arguments ?? {}, signal);
         messages.push({
           role: "toolResult",
           toolCallId: call.id,

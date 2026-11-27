@@ -13,6 +13,7 @@ import { canonicalizePath } from "../src/policy.ts";
 import {
   buildRuntimeConfig,
   clearSessionAllowances,
+  createReviewExec,
   createSandboxedBashOps,
   resolveAllowances,
   supportsNodeEnvProxy,
@@ -459,4 +460,35 @@ test("clearSessionAllowances empties the grant lists in place", () => {
   assert.equal(allowances.domains, domains);
   assert.equal(allowances.readPaths, readPaths);
   assert.equal(allowances.writePaths, writePaths);
+});
+
+test("reviewer commands run sandboxed with no writes and no network", async () => {
+  const calls: unknown[] = [];
+  const manager = {
+    getConfig: () => ({
+      filesystem: { denyRead: ["/secret"], allowRead: [], allowWrite: ["/work"], denyWrite: [] },
+      network: { allowedDomains: ["example.com"], deniedDomains: [] },
+    }),
+    wrapWithSandbox: async (command: string, _shell: string, custom: unknown) => {
+      calls.push(custom);
+      return command;
+    },
+    cleanupAfterCommand: () => calls.push("cleanup"),
+  } as unknown as typeof SandboxManager;
+  const result = await createReviewExec(manager)("printf ok; exit 3", tmpdir());
+  assert.equal(result.stdout.toString(), "ok");
+  assert.equal(result.exitCode, 3);
+  assert.deepEqual(calls, [
+    {
+      filesystem: {
+        denyRead: ["/secret"],
+        allowRead: [],
+        allowWrite: [],
+        denyWrite: [],
+        disabled: false,
+      },
+      network: { allowedDomains: [], deniedDomains: [] },
+    },
+    "cleanup",
+  ]);
 });

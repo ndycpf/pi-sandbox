@@ -10,9 +10,9 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import type { ReadPolicy } from "./host-review-tools.ts";
+import type { ReviewExec } from "./host-review-tools.ts";
 
-import { DEFAULT_CONFIG, DEFAULT_HOST_BASH_CONFIG, type HostBashConfig } from "./config.ts";
+import { DEFAULT_HOST_BASH_CONFIG, type HostBashConfig } from "./config.ts";
 import { REJECTION_INSTRUCTIONS } from "./host-review-prompt.ts";
 import {
   appendReviewLog,
@@ -187,14 +187,9 @@ export type HostBashDeps = {
   reviewer?: (ctx: ExtensionContext, model: string) => Reviewer;
   /** Bounded JSONL log of auto-review decisions. */
   logFile?: string;
-  /** The sandbox's read rules, which also bound the reviewer's read and ls. */
-  readPolicy?: (cwd: string) => ReadPolicy;
+  /** Runs the reviewer's read and ls in the sandbox, read-only and offline. */
+  reviewExec?: ReviewExec;
 };
-
-const defaultReadPolicy = (): ReadPolicy => ({
-  denyRead: DEFAULT_CONFIG.filesystem?.denyRead ?? [],
-  allowRead: DEFAULT_CONFIG.filesystem?.allowRead ?? [],
-});
 
 export function registerHostBash(
   pi: ExtensionAPI,
@@ -324,7 +319,7 @@ export function registerHostBash(
             review,
             action,
             transcriptRecords(ctx.sessionManager.getBranch?.() ?? []),
-            (deps.readPolicy ?? defaultReadPolicy)(cwd),
+            deps.reviewExec,
             lifetime,
           );
           if (!current()) throw new Error(refusal);

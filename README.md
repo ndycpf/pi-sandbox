@@ -296,16 +296,18 @@ in Codex's extra-policy slot. Its user message has:
 
 Like Codex's reviewer, it can check local state before deciding, but only with
 two read-only tools: `read` (up to 16 KiB of a text file, with a line offset)
-and `ls` (up to 200 entries). It may read only what the agent's sandbox can
-read (the same `denyRead`/`allowRead` rules, after resolving symlinks), and
-never secret files even where the sandbox could: every `credentials.files`
-path in your sandbox config (masked or denied), `/proc`, `/sys`, `/dev`,
+and `ls` (up to 200 entries). As in Codex, they run in the agent's sandbox
+(`head -c` and `ls`), with writes denied and no network, so they see exactly
+what sandboxed commands see: `denyRead`/`allowRead` and `credentials.files`
+apply as usual, and a denied path fails or looks empty. On top of that, the
+reviewer never reads secret files even where the sandbox could, because what it
+reads is sent to the model provider: `/proc`, `/sys`, `/dev`,
 `~/.pi/agent/auth.json`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`,
 `~/.docker`, `~/.config/gh`, `~/.config/gcloud`, keychains, `.env*`,
 `*.pem`/`*.key` and similar, `id_*`, `.netrc`, `.npmrc`, credentials files.
-Each check opens the file first, applies these rules to the path it resolves
-to, and reads only if that path still names the opened file, so a symlink
-swapped mid-check is refused. A review gets at most 8 tool calls and 64 KiB of tool
+That list is a path check after resolving symlinks, not a sandbox rule, so a
+symlink swapped between the check and the read can get past it; the sandbox's
+own rules still hold. A review gets at most 8 tool calls and 64 KiB of tool
 output. The prompt tells it to look only when the result could change its
 decision (for example the target of an `rm -rf` or a script a command runs) and
 that what it reads is untrusted evidence. Its checks are listed in the review

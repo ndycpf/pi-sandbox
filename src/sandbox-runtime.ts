@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 
 import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-agent";
 
+import type { ReviewExec } from "./host-review-tools.ts";
+
 import { type SandboxConfig } from "./config.ts";
 import { canonicalizePath } from "./policy.ts";
 
@@ -339,5 +341,52 @@ export function createSandboxedBashOps(
         manager.cleanupAfterCommand();
       }
     },
+  };
+}
+
+const REVIEW_EXEC_TIMEOUT_MS = 10_000;
+const REVIEW_EXEC_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Runs the auto-reviewer's read-only commands in the sandbox, with the
+ * session's read rules (and credentials), no writes beyond the runtime's
+ * defaults, and no network. Output is capped and the command is time-limited.
+ */
+export function createReviewExec(manager: ISandboxManager): ReviewExec {
+  return async (command, cwd, signal) => {
+    const config = manager.getConfig();
+    if (!config) throw new Error("sandbox not initialized");
+    const wrapped = await manager.wrapWithSandbox(
+      command,
+      "/bin/sh",
+      {
+        filesystem: { ...config.filesystem, disabled: false, allowWrite: [], denyWrite: [] },
+        network: { ...config.network, allowedDomains: [] },
+      },
+      signal,
+    );
+    try {
+      return await new Promise((resolve, reject) => {
+        const child = spawn("/bin/sh", ["-c", wrapped], {
+          cwd,
+          env: { PATH: process.env.PATH, HOME: process.env.HOME },
+          stdio: ["ignore", "pipe", "ignore"],
+          signal: AbortSignal.any([
+            ...(signal ? [signal] : []),
+            AbortSignal.timeout(REVIEW_EXEC_TIMEOUT_MS),
+          ]),
+        });
+        const chunks: Buffer[] = [];
+        let size = 0;
+        child.stdout.on("data", (chunk: Buffer) => {
+          if (size < REVIEW_EXEC_MAX_BYTES) chunks.push(chunk);
+          size += chunk.length;
+        });
+        child.once("error", reject);
+        child.once("close", (exitCode) => resolve({ stdout: Buffer.concat(chunks), exitCode }));
+      });
+    } finally {
+      manager.cleanupAfterCommand();
+    }
   };
 }

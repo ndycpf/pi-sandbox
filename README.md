@@ -254,24 +254,39 @@ like the rest of `hostBash`, can only be turned on in the global config:
 }
 ```
 
-The reviewer gets the command, resolved working directory, shell, inherited
-`PATH`, time limit, how much output the agent will see, the agent's one-line
-`reason` and your latest message in the session. It is told that all of these
-are data, not instructions, and to treat workspace scripts, package scripts,
-git hooks and programs on a workspace `PATH` entry as code it cannot see. It
-answers `allow`, `deny` or `ask`:
+The reviewer works like the auto-review ("Guardian") in OpenAI Codex, and its
+instructions and context are adapted from Codex's open-source reviewer. Its
+system prompt is Codex's reviewer template and default security policy
+(risk taxonomy, user-authorization scoring, data exfiltration, credential
+probing, security weakening, destructive actions), with your `policyFile`
+in Codex's extra-policy slot. Its user message has:
 
-- **allow** runs the command without a prompt. It is the only answer that does,
-  and an `allow` the reviewer itself rates `high` or `critical` risk counts as `ask`.
-- **ask**, an error, a timeout, a missing model or credentials, or any answer
-  that is not exactly the expected JSON shows you the normal prompt.
-- **deny** returns the reviewer's reason to the agent without prompting you.
-  After 3 denials in a row, auto-review pauses for the rest of the session and
-  every call is prompted.
+- the session transcript as JSON records: your messages, the agent's text and
+  tool calls, and tool results (reasoning is left out). Like Codex, your
+  messages are kept first, then the 40 most recent other entries, within
+  token budgets; long entries are cut in the middle with a `<truncated ... />`
+  marker. Only your messages count as trusted authorization;
+- the planned action JSON: `tool`, the exact `command` argv, `cwd`, the
+  agent's one-line `reason` as `justification`, `PATH` and `HOME`, the time
+  limit and how much output the agent will see.
 
-`/host-auto off` pauses auto-review for the current session (every call is
-prompted), `/host-auto on` resumes it, and `/host-auto` shows the state. The
-command cannot turn auto-review on when the global config does not.
+It answers with Codex's JSON contract (`outcome` `allow`/`deny`, `risk_level`,
+`user_authorization`, `rationale`):
+
+- **allow** runs the command without a prompt. It is the only answer that does.
+  Unlike Codex, which can allow a `high`-risk action the user authorized, an
+  allow rated `high` or `critical` shows you the prompt, because this reviewer
+  cannot run read-only checks first.
+- An error, a timeout, a missing model or credentials, or an answer without a
+  valid `outcome` shows you the normal prompt.
+- **deny** returns the rationale to the agent with Codex's rejection
+  instructions (no workaround; use a safer alternative or ask you), without
+  prompting you. If you then approve the action in the chat, the next review
+  sees that in the transcript. After 3 denials in a row, auto-review pauses for
+  the rest of the session and every call is prompted.
+
+Auto-review is turned on and off only in the global config; restart Pi after
+changing it.
 
 Some commands always come to you whatever the reviewer would say: `sudo` and
 similar, `rm` with `-r` or `-f`, piping into a shell, disk-level tools, paths
@@ -290,12 +305,13 @@ notification, and every review is appended to
 **What auto-review cannot catch.** The reviewer sees text, not the machine. It
 cannot see the contents of files a command runs or reads, so a harmless-looking
 `make test` or `git commit` can run code the agent wrote earlier in the
-workspace (it is told to answer `ask` for these, but it may not). Text in the
-command, the agent's reason or your pasted messages can try to talk it into
-`allow` (prompt injection). It can misjudge what a command does, especially an
+workspace, unless that code shows up in the transcript; unlike Codex's
+reviewer, it cannot read files to check. Text in the command, the agent's
+reason, tool output or your pasted messages can try to talk it into `allow`
+(prompt injection). It can misjudge what a command does, especially an
 unusual or obfuscated one. Commands it allows run with your full user rights,
-and each review sends the command, working directory, `PATH` and your latest
-message to the model provider you configured. Use auto-review for convenience
+and each review sends the command, working directory, `PATH` and the session
+transcript (up to roughly 30k tokens) to the model provider you configured. Use auto-review for convenience
 on a machine and model you trust, not as a security boundary; keep `mode:
 "human"` where a wrong `allow` would be costly.
 
@@ -376,3 +392,8 @@ Based on code from
 [badlogic/pi-mono](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/examples/extensions/sandbox/index.ts)
 by Mario Zechner, used under the
 [MIT License](https://github.com/badlogic/pi-mono/blob/main/LICENSE).
+
+The `host_bash` auto-review instructions and context framing
+(`src/host-review-prompt.ts`) are adapted from
+[OpenAI Codex](https://github.com/openai/codex), Copyright 2025 OpenAI, used
+under the Apache License 2.0; see `third-party/openai-codex/`.

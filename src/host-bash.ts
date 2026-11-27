@@ -11,12 +11,14 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import { DEFAULT_HOST_BASH_CONFIG, type HostBashConfig } from "./config.ts";
+import { REJECTION_INSTRUCTIONS } from "./host-review-prompt.ts";
 import {
   appendReviewLog,
-  latestUserRequest,
+  type PlannedAction,
   modelReviewer,
   type Reviewer,
   reviewCommand,
+  transcriptRecords,
 } from "./host-review.ts";
 
 const shell = "/bin/bash";
@@ -176,8 +178,8 @@ export function registerHostBash(
         id: string;
         lifetime: AbortController;
         denials: number;
-        /** Why auto-review is off for the rest of this session, if it is. */
-        paused?: "denials" | "operator";
+        /** Auto-review is off for the rest of this session after repeated denials. */
+        paused?: boolean;
       }
     | undefined;
   const showStatus = (ctx: ExtensionContext) => {
@@ -190,36 +192,6 @@ export function registerHostBash(
         : `host_bash: auto-review (${review.model})`,
     );
   };
-
-  pi.registerCommand?.("host-auto", {
-    description: "Pause or resume host_bash auto-review for this session: /host-auto [on|off]",
-    handler: async (args, ctx) => {
-      const review = config(ctx.cwd).review;
-      const arg = args.trim();
-      if (review.mode !== "auto") {
-        ctx.ui.notify(
-          'host_bash auto-review is not configured. Set hostBash.review.mode to "auto" in the global sandbox.json.',
-          "info",
-        );
-        return;
-      }
-      if (session && arg === "off") session.paused = "operator";
-      else if (session && arg === "on") {
-        session.paused = undefined;
-        session.denials = 0;
-      } else if (arg) {
-        ctx.ui.notify("Usage: /host-auto [on|off]", "warning");
-        return;
-      }
-      showStatus(ctx);
-      ctx.ui.notify(
-        session?.paused
-          ? "host_bash auto-review is paused for this session; every call is prompted."
-          : `host_bash auto-review is on (${review.model}).`,
-        "info",
-      );
-    },
-  });
 
   pi.registerTool({
     name: "host_bash",
@@ -296,21 +268,22 @@ export function registerHostBash(
         const review = options.review;
         let approvedBy: "operator" | "reviewer" = "operator";
         if (review.mode === "auto" && review.model && !active.paused) {
-          const request = latestUserRequest(ctx);
+          const action: PlannedAction = {
+            tool: "host_bash",
+            command: [shell, "--noprofile", "--norc", "-c", command],
+            cwd,
+            sandbox_permissions: "require_escalated",
+            ...(reason && { justification: reason }),
+            tty: false,
+            env: { PATH: path, ...(process.env.HOME && { HOME: process.env.HOME }) },
+            timeout_seconds: options.timeoutSeconds,
+            output_to_agent: outputPolicy(options),
+          };
           const verdict = await reviewCommand(
             makeReviewer(ctx, review.model),
             review,
-            {
-              command,
-              cwd,
-              shell: `${shell} --noprofile --norc -c`,
-              path,
-              ...(process.env.HOME && { home: process.env.HOME }),
-              timeoutSeconds: options.timeoutSeconds,
-              output: outputPolicy(options),
-              ...(reason && { agentReason: reason }),
-              ...(request !== undefined && { userRequest: request }),
-            },
+            action,
+            transcriptRecords(ctx.sessionManager.getBranch?.() ?? []),
             lifetime,
           );
           if (!current()) throw new Error(refusal);
@@ -332,18 +305,18 @@ export function registerHostBash(
           } else if (verdict.decision === "deny") {
             active.denials++;
             const paused = active.denials >= maxDenials;
-            if (paused) active.paused = "denials";
+            if (paused) active.paused = true;
             ctx.ui.notify(
               `host_bash denied by auto-review: ${verdict.reason}` +
                 (paused
-                  ? `\nAuto-review paused for this session after ${maxDenials} denials in a row; you will be asked instead. /host-auto on resumes it.`
+                  ? `\nAuto-review paused for this session after ${maxDenials} denials in a row; you will be asked instead.`
                   : ""),
               "warning",
             );
             showStatus(ctx);
             throw new ApprovalRefused(
               `Host command denied by the automatic reviewer: ${verdict.reason} ` +
-                "Do not retry it or rephrase it to get past the review. If the task really needs it, stop and explain to the operator what you want to run and why.",
+                REJECTION_INSTRUCTIONS,
             );
           } else {
             ctx.ui.notify(`host_bash auto-review asks you to decide: ${verdict.reason}`, "info");

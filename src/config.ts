@@ -54,7 +54,7 @@ export type SandboxConfigFile = Omit<Partial<SandboxConfig>, "network" | "filesy
 export const DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS = 10 * 60;
 
 export type HostBashConfig = {
-  /** Register `bash_with_human_approval`. */
+  /** Register `host_bash`. */
   enabled: boolean;
   /** Execution limit for one approved command. */
   timeoutSeconds: number;

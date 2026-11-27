@@ -16,9 +16,9 @@ import {
   mergeConfigLayers,
   resolveHostBashConfig,
 } from "../src/config.ts";
-import { hostPath, registerUnsandboxBash, titleRows } from "../src/unsandbox-bash.ts";
+import { hostPath, registerHostBash, titleRows } from "../src/host-bash.ts";
 
-test("bash_with_human_approval requires one current affirmative terminal approval", async (t) => {
+test("host_bash requires one current affirmative terminal approval", async (t) => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-approval-")));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   for (const stream of [process.stdin, process.stdout]) {
@@ -31,10 +31,10 @@ test("bash_with_human_approval requires one current affirmative terminal approva
     );
   }
   let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
-  const host = registerUnsandboxBash(
+  const host = registerHostBash(
     {
       registerTool(def: typeof tool) {
-        assert.equal(def.name, "bash_with_human_approval");
+        assert.equal(def.name, "host_bash");
         tool = def;
       },
     } as ExtensionAPI,
@@ -154,9 +154,9 @@ test("bash_with_human_approval requires one current affirmative terminal approva
   assert.equal(launch.mock.callCount(), 1);
 });
 
-test("bash_with_human_approval refuses when hostBash is disabled", async (t) => {
+test("host_bash refuses when hostBash is disabled", async (t) => {
   let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
-  const host = registerUnsandboxBash(
+  const host = registerHostBash(
     { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,
     () => true,
     () => DEFAULT_HOST_BASH_CONFIG,

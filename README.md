@@ -175,9 +175,9 @@ Saved project or global permission changes are not broadcast to other running
 sessions' sandbox managers. Restart affected sessions to apply grants or revocations
 consistently.
 
-### Bash with human approval
+### Host Bash
 
-`bash_with_human_approval` lets an agent ask the human operator to run one
+`host_bash` lets an agent ask the human operator to run one
 `command` outside the sandbox. It is off by default. Enable it in the **global**
 config only (`~/.pi/agent/sandbox.json`); a `hostBash` entry in a project
 `.pi/sandbox.json` is ignored. The tool is registered at session start, so

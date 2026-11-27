@@ -72,7 +72,7 @@ async function approve(
         `With this call's CWD, the command gets ${available} rows of ${assumedColumns - 2} columns; ` +
         `as shown (JSON-quoted) it has ${shown.length} ${shown.length === 1 ? "line" : "lines"} and needs ${rows - (maxTitleRows - available)} rows. ` +
         "The operator could not read all of it. " +
-        "Shorten the command (fewer and shorter lines) and call again: split it into several bash_with_human_approval calls, " +
+        "Shorten the command (fewer and shorter lines) and call again: split it into several host_bash calls, " +
         "remove comments and blank lines, or run the parts that do not need the host in ordinary sandboxed bash. " +
         "Do not move the logic into a script file to shorten it; the operator cannot review a file's contents in the prompt.",
     );
@@ -139,7 +139,7 @@ function format(code: number | null, tail: Tail | undefined, path: string) {
   return status + outputText(tail);
 }
 
-export function registerUnsandboxBash(
+export function registerHostBash(
   pi: ExtensionAPI,
   ready: () => boolean,
   config: (cwd: string) => HostBashConfig = () => DEFAULT_HOST_BASH_CONFIG,
@@ -149,8 +149,8 @@ export function registerUnsandboxBash(
     | undefined;
 
   pi.registerTool({
-    name: "bash_with_human_approval",
-    label: "Bash with human approval",
+    name: "host_bash",
+    label: "Host Bash",
     description:
       "Run one Bash command on the host, outside the OS sandbox, after the human operator approves it in the interactive CLI. " +
       "Ordinary bash runs inside the sandbox, which blocks paths outside the workspace, most network hosts, local services and credential stores. " +
@@ -163,8 +163,8 @@ export function registerUnsandboxBash(
       "Returns the exit status and, when enabled, the tail of combined stdout/stderr.",
     promptSnippet: "Ask the operator to run one Bash command outside the sandbox",
     promptGuidelines: [
-      "When sandboxed bash is blocked or misleading because of the sandbox (permission errors, blocked network, a host tool not found, an unreachable daemon, invalid credentials), do not give up or report the sandboxed result as the host state: call bash_with_human_approval with the same command and say in one sentence why host access is needed.",
-      "Do not use bash_with_human_approval for work that succeeds in the sandbox.",
+      "When sandboxed bash is blocked or misleading because of the sandbox (permission errors, blocked network, a host tool not found, an unreachable daemon, invalid credentials), do not give up or report the sandboxed result as the host state: call host_bash with the same command and say in one sentence why host access is needed.",
+      "Do not use host_bash for work that succeeds in the sandbox.",
     ],
     executionMode: "sequential",
     parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 4096 }) }),

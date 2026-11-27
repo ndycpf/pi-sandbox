@@ -16,6 +16,7 @@ import {
   loadConfig,
   resolveHostBashConfig,
 } from "./config.ts";
+import { registerHostBash } from "./host-bash.ts";
 import {
   canonicalizePath,
   domainIsAllowed,
@@ -46,7 +47,6 @@ import {
   warnIfAllDomainsAllowed,
   warnIfLinuxUnenforcedGlobs,
 } from "./ui.ts";
-import { registerUnsandboxBash } from "./unsandbox-bash.ts";
 
 export default function (pi: ExtensionAPI) {
   const sandboxManager = createSandboxManager();
@@ -64,7 +64,7 @@ export default function (pi: ExtensionAPI) {
   let sandboxEnabled = false;
   let sandboxInitialized = false;
   // Registered on session start only when global config enables it.
-  let hostBash: ReturnType<typeof registerUnsandboxBash> | undefined;
+  let hostBash: ReturnType<typeof registerHostBash> | undefined;
   let projectTrusted = false;
   const allowances: SessionAllowances = { domains: [], readPaths: [], writePaths: [] };
 
@@ -480,7 +480,7 @@ export default function (pi: ExtensionAPI) {
       registerAccessTools();
     }
     if (!hostBash && loadConfig(ctx.cwd, projectTrusted).hostBash?.enabled === true) {
-      hostBash = registerUnsandboxBash(
+      hostBash = registerHostBash(
         pi,
         () => sandboxEnabled && sandboxInitialized,
         // hostBash is global-only, so project trust does not change it.

@@ -8,7 +8,7 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 
 import { DEFAULT_HOST_BASH_CONFIG, type HostBashConfig } from "../src/config.ts";
-import { registerUnsandboxBash } from "../src/unsandbox-bash.ts";
+import { registerHostBash } from "../src/host-bash.ts";
 
 const supported = ["linux", "darwin"].includes(process.platform);
 
@@ -25,7 +25,7 @@ function fixture(t: TestContext, options: Partial<HostBashConfig> = {}) {
     );
   }
   let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
-  const host = registerUnsandboxBash(
+  const host = registerHostBash(
     { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,
     () => true,
     () => ({ ...DEFAULT_HOST_BASH_CONFIG, enabled: true, ...options }),

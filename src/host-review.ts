@@ -28,10 +28,31 @@ export type HostReviewConfig = {
   timeoutSeconds: number;
   /** The review log: JSON lines, rotated by size, with a fixed number of files kept. */
   log: ReviewLogConfig;
+  /**
+   * The reviewer's thinking level, passed to pi-ai as `reasoning`. Codex's
+   * Guardian uses "low" when the model offers it; models without reasoning
+   * ignore it.
+   */
+  thinking: ReviewThinking;
   /** Absolute paths of the programs the reviewer's read and ls run. */
   binaries: ReviewBinaries;
   /** Why an "auto" config was rejected; review then stays "human". */
   error?: string;
+};
+
+export const REVIEW_THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ReviewThinking = (typeof REVIEW_THINKING)[number];
+
+// Room for thinking on top of the 2048-token answer, for providers whose output
+// cap includes reasoning tokens (pi-ai's default thinking budgets).
+const thinkingTokens: Record<ReviewThinking, number> = {
+  off: 0,
+  minimal: 1024,
+  low: 2048,
+  medium: 8192,
+  high: 16384,
+  xhigh: 16384,
+  max: 16384,
 };
 
 export type ReviewLogConfig = {
@@ -52,6 +73,7 @@ export const DEFAULT_HOST_REVIEW_CONFIG: HostReviewConfig = {
   mode: "human",
   timeoutSeconds: 60,
   log: DEFAULT_REVIEW_LOG_CONFIG,
+  thinking: "low",
   binaries: resolveReviewBinaries(undefined).binaries,
 };
 
@@ -87,16 +109,26 @@ export function resolveHostReviewConfig(value: unknown): HostReviewConfig {
       : DEFAULT_HOST_REVIEW_CONFIG.timeoutSeconds;
   const log = resolveReviewLogConfig(raw.log);
   const { binaries, error: binariesError } = resolveReviewBinaries(raw.binaries);
-  if (raw.mode !== "auto") return { mode: "human", timeoutSeconds, log, binaries };
+  const thinking = raw.thinking === undefined ? DEFAULT_HOST_REVIEW_CONFIG.thinking : raw.thinking;
+  const validThinking = REVIEW_THINKING.includes(thinking as ReviewThinking);
+  const base = {
+    timeoutSeconds,
+    log,
+    thinking: validThinking ? (thinking as ReviewThinking) : DEFAULT_HOST_REVIEW_CONFIG.thinking,
+    binaries,
+  };
+  if (raw.mode !== "auto") return { mode: "human", ...base };
   // An "auto" config the operator got wrong must not run with less than they
   // configured: it falls back to human review and says why.
   const error = !model
     ? 'hostBash.review.model must be "provider/model-id"'
     : raw.policyFile !== undefined && !(policyFile && isAbsolute(policyFile))
       ? "hostBash.review.policyFile must be an absolute path or start with ~/"
-      : binariesError;
-  if (error) return { mode: "human", timeoutSeconds, log, binaries, error };
-  return { mode: "auto", model, ...(policyFile && { policyFile }), timeoutSeconds, log, binaries };
+      : !validThinking
+        ? `hostBash.review.thinking must be one of ${REVIEW_THINKING.join(", ")}`
+        : binariesError;
+  if (error) return { mode: "human", ...base, error };
+  return { mode: "auto", model, ...(policyFile && { policyFile }), ...base };
 }
 
 /** The planned action JSON, in the shape Codex gives its reviewer for a command. */
@@ -414,7 +446,11 @@ export async function reviewCommand(
 }
 
 /** A reviewer backed by a model from Pi's registry, using Pi's own credentials. */
-export function modelReviewer(ctx: ExtensionContext, target: string): Reviewer {
+export function modelReviewer(
+  ctx: ExtensionContext,
+  target: string,
+  thinking: ReviewThinking = DEFAULT_HOST_REVIEW_CONFIG.thinking,
+): Reviewer {
   return async (system, user, signal, tools) => {
     const slash = target.indexOf("/");
     const model = ctx.modelRegistry.find(target.slice(0, slash), target.slice(slash + 1));
@@ -435,7 +471,8 @@ export function modelReviewer(ctx: ExtensionContext, target: string): Reviewer {
           headers: auth.headers,
           env: auth.env,
           signal,
-          maxTokens: 2048,
+          maxTokens: 2048 + thinkingTokens[thinking],
+          ...(thinking !== "off" && { reasoning: thinking }),
           maxRetries: 1,
         },
       );

@@ -19,6 +19,7 @@ import {
   type PlannedAction,
   modelReviewer,
   type Reviewer,
+  type ReviewThinking,
   reviewCommand,
   transcriptRecords,
 } from "./host-review.ts";
@@ -184,7 +185,7 @@ function format(code: number | null, tail: Tail | undefined, path: string) {
 
 export type HostBashDeps = {
   /** Builds the reviewer for the configured model. */
-  reviewer?: (ctx: ExtensionContext, model: string) => Reviewer;
+  reviewer?: (ctx: ExtensionContext, model: string, thinking: ReviewThinking) => Reviewer;
   /** Bounded JSONL log of auto-review decisions. */
   logFile?: string;
   /** Runs the reviewer's read and ls in the sandbox, read-only and offline. */
@@ -315,7 +316,7 @@ export function registerHostBash(
             output_to_agent: outputPolicy(options),
           };
           const verdict = await reviewCommand(
-            makeReviewer(ctx, review.model),
+            makeReviewer(ctx, review.model, review.thinking),
             review,
             action,
             transcriptRecords(ctx.sessionManager.getBranch?.() ?? []),

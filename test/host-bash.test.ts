@@ -209,6 +209,7 @@ test("hostBash config is global-only and validated", () => {
       mode: "human",
       timeoutSeconds: 60,
       log: { enabled: true, maxBytes: 1048576, files: 3 },
+      thinking: "low",
       binaries: DEFAULT_HOST_REVIEW_CONFIG.binaries,
     },
   });

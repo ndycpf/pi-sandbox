@@ -61,6 +61,7 @@ const auto: HostReviewConfig = {
   model: "fake/reviewer",
   timeoutSeconds: 30,
   log: DEFAULT_REVIEW_LOG_CONFIG,
+  thinking: "low",
   binaries: DEFAULT_HOST_REVIEW_CONFIG.binaries,
 };
 const bins = DEFAULT_HOST_REVIEW_CONFIG.binaries;
@@ -108,6 +109,7 @@ test("review config defaults to human and needs an explicit model for auto", () 
       model: "openrouter/anthropic/claude",
       timeoutSeconds: 60,
       log: DEFAULT_REVIEW_LOG_CONFIG,
+      thinking: "low",
       binaries: bins,
     },
   );
@@ -514,7 +516,11 @@ test("modelReviewer calls the configured model with Pi's credentials", async (t)
   const faux = registerFauxProvider({ provider: "faux-review" });
   t.after(() => faux.unregister());
   const model = faux.getModel();
-  faux.setResponses([fauxAssistantMessage('{"outcome":"allow"}')]);
+  const sent: unknown[] = [];
+  faux.setResponses([
+    (_context, options) => (sent.push(options), fauxAssistantMessage('{"outcome":"allow"}')),
+    (_context, options) => (sent.push(options), fauxAssistantMessage('{"outcome":"allow"}')),
+  ]);
   let asked = "";
   const ctx = {
     modelRegistry: {
@@ -537,6 +543,18 @@ test("modelReviewer calls the configured model with Pi's credentials", async (t)
   assert.equal(asked, target);
   assert.equal(verdict.decision, "allow");
   assert.equal(faux.state.callCount, 1);
+  // Codex's default thinking level, with room for it in the output cap.
+  assert.partialDeepStrictEqual(sent[0], { reasoning: "low", maxTokens: 4096 });
+  await reviewCommand(
+    modelReviewer(ctx, target, "off"),
+    { ...auto, model: target },
+    input,
+    [],
+    exec,
+    new AbortController().signal,
+  );
+  assert.equal((sent[1] as { reasoning?: string }).reasoning, undefined);
+  assert.equal((sent[1] as { maxTokens?: number }).maxTokens, 2048);
   const missing = await reviewCommand(
     modelReviewer(ctx, "nope/model"),
     auto,
@@ -684,6 +702,11 @@ test("reviewer binaries default to the usual paths and can be set", () => {
   const { binaries } = resolveReviewBinaries(undefined);
   for (const path of Object.values(binaries)) assert.ok(path && existsSync(path));
   assert.equal(resolveReviewBinaries({ head: "/opt/bin/head" }).binaries.head, "/opt/bin/head");
+  const thinking = resolveHostReviewConfig({ mode: "auto", model: "a/b", thinking: "medium" });
+  assert.equal(thinking.thinking, "medium");
+  const badThinking = resolveHostReviewConfig({ mode: "auto", model: "a/b", thinking: "huge" });
+  assert.equal(badThinking.mode, "human");
+  assert.match(badThinking.error ?? "", /^hostBash\.review\.thinking must be one of off, minimal/);
   const review = resolveHostReviewConfig({ mode: "auto", model: "a/b", binaries: { ls: "ls" } });
   assert.equal(review.mode, "human");
   assert.equal(review.error, "hostBash.review.binaries.ls must be an absolute path");

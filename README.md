@@ -268,6 +268,11 @@ like the rest of `hostBash`, can only be turned on in the global config:
       // Limit for one review, including its file checks (5-180, default 60);
       // on expiry you are prompted.
       "timeoutSeconds": 60,
+      // The reviewer's thinking level: "off", "minimal", "low", "medium",
+      // "high", "xhigh" or "max". Default "low", as in Codex's auto-review;
+      // models without reasoning ignore it. Higher levels take longer and
+      // count against timeoutSeconds.
+      "thinking": "low",
       // Review log at ~/.pi/agent/host-bash-review.log. When a file passes
       // maxBytes (64 KiB-64 MiB, default 1 MiB) it is rotated, keeping `files`
       // files (1-20, default 3, about 3 MiB). "enabled": false writes nothing.
@@ -342,7 +347,7 @@ It answers with Codex's JSON contract (`outcome` `allow`/`deny`, `risk_level`,
   the rest of the session and every call is prompted.
 
 Auto-review is turned on and off only in the global config; restart Pi after
-changing it. An `"auto"` config with a bad `model`, `policyFile` or `binaries` entry is not used:
+changing it. An `"auto"` config with a bad `model`, `policyFile`, `thinking` or `binaries` entry is not used:
 every call is prompted, and Pi shows the error at session start and
 `host_bash: human (review config error)` in the status bar.
 

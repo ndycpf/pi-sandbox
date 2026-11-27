@@ -193,13 +193,15 @@ async function dialogPermissionPrompt(
   // The client gets the time left so it can expire its card when Pi stops waiting.
   const remaining = () =>
     deadline === undefined ? undefined : Math.max(1, Math.ceil(deadline - performance.now()));
+  // The abort timer can fire after a late answer is processed, so check the clock too.
+  const expired = () => dialog.aborted || (deadline !== undefined && performance.now() >= deadline);
   const options = permissionOptions(ctx.cwd);
   const labels = options.map((option) =>
     option.hint ? `${option.label} ${option.hint}` : option.label,
   );
   const choice = await ctx.ui.select(title, labels, { signal: dialog, timeout: remaining() });
   const option = choice === undefined ? undefined : options[labels.indexOf(choice)];
-  if (!option || option.action === "abort" || dialog.aborted) return aborted;
+  if (!option || option.action === "abort" || expired()) return aborted;
   if (validateValue(originalValue) !== null) return aborted;
   if (option.confirm) {
     const confirmed = await ctx.ui.confirm(
@@ -207,8 +209,9 @@ async function dialogPermissionPrompt(
       `Save "${originalValue}" ${option.hint ?? ""}`.trim(),
       { signal: dialog, timeout: remaining() },
     );
-    if (confirmed !== true || dialog.aborted) return aborted;
+    if (confirmed !== true) return aborted;
   }
+  if (expired()) return aborted;
   return { action: option.action, value: originalValue };
 }
 

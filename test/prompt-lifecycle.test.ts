@@ -402,3 +402,35 @@ test("RPC mode asks through select and confirm dialogs, never the widget", async
   assert.equal(asked.length, before);
   assert.equal(f.mounts.length, 0);
 });
+
+test("RPC answers that arrive after the deadline never grant access", async (t) => {
+  const f = fixture(t);
+  const labels = prompts
+    .permissionOptions("/workspace")
+    .map((o) => (o.hint ? `${o.label} ${o.hint}` : o.label));
+  // Block the event loop past the deadline so the abort timer has not run yet.
+  const late = <T>(value: T) => {
+    const end = performance.now() + 30;
+    while (performance.now() < end);
+    return Promise.resolve(value);
+  };
+  let confirms = 0;
+  let selectAnswer = (): Promise<string> => late(labels[0]!);
+  const ctx = {
+    ...f.ctx,
+    mode: "rpc",
+    ui: {
+      ...f.ctx.ui,
+      select: () => selectAnswer(),
+      confirm: () => (confirms++, late(true)),
+    },
+  } as unknown as ExtensionContext;
+  const ask = () =>
+    prompts.showPermissionPrompt(f.pi, ctx, "Blocked", "example.com", () => null, 0.01);
+  assert.equal((await ask()).action, "abort");
+  assert.equal(confirms, 0);
+  // A late confirmation of a persistent rule is refused as well.
+  selectAnswer = () => Promise.resolve(labels[2]!);
+  assert.equal((await ask()).action, "abort");
+  assert.equal(confirms, 1);
+});

@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, posix } from "node:path";
 
 import { type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -84,6 +84,20 @@ function expandHome(entry: string) {
   return match ? join(homedir(), entry.slice(match[0].length)) : entry;
 }
 
+// Absolute and already normalized: no ".", "..", empty or trailing components.
+// The OS resolves ".." after following symlinks, so such entries could be
+// checked at one place and searched at another.
+export function isPlainAbsolutePath(entry: string) {
+  return (
+    entry.startsWith("/") &&
+    !entry.includes(":") &&
+    !entry.includes("\0") &&
+    posix.normalize(entry) === entry &&
+    !entry.split("/").some((part) => part === "." || part === "..") &&
+    (entry === "/" || !entry.endsWith("/"))
+  );
+}
+
 /** Validate a global `hostBash` entry, dropping invalid values. */
 export function resolveHostBashConfig(value: unknown): HostBashConfig {
   const raw = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
@@ -91,13 +105,7 @@ export function resolveHostBashConfig(value: unknown): HostBashConfig {
   return {
     enabled: raw.enabled === true,
     extraPath: [
-      ...new Set(
-        (stringArray(raw.extraPath) ?? [])
-          .map(expandHome)
-          .filter(
-            (entry) => entry.startsWith("/") && !entry.includes(":") && !entry.includes("\0"),
-          ),
-      ),
+      ...new Set((stringArray(raw.extraPath) ?? []).map(expandHome).filter(isPlainAbsolutePath)),
     ],
     timeoutSeconds: boundedInteger(raw.timeoutSeconds, 1, 3600, defaults.timeoutSeconds),
     outputBytes: boundedInteger(raw.outputBytes, 0, 64 * 1024, defaults.outputBytes),

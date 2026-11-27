@@ -12,21 +12,6 @@ import { registerUnsandboxBash } from "../src/unsandbox-bash.ts";
 
 const supported = ["linux", "darwin"].includes(process.platform);
 
-function fakeTerminal(t: TestContext, rows = 100, columns = 200) {
-  for (const [key, value] of [
-    ["rows", rows],
-    ["columns", columns],
-  ] as const) {
-    const previous = Object.getOwnPropertyDescriptor(process.stdout, key);
-    Object.defineProperty(process.stdout, key, { configurable: true, value });
-    t.after(() =>
-      previous
-        ? Object.defineProperty(process.stdout, key, previous)
-        : Reflect.deleteProperty(process.stdout, key),
-    );
-  }
-}
-
 function fixture(t: TestContext, options: Partial<HostBashConfig> = {}) {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-real-")));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
@@ -39,7 +24,6 @@ function fixture(t: TestContext, options: Partial<HostBashConfig> = {}) {
         : Reflect.deleteProperty(stream, "isTTY"),
     );
   }
-  fakeTerminal(t);
   let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
   const host = registerUnsandboxBash(
     { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,

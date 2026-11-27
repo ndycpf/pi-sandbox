@@ -8,7 +8,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { DEFAULT_HOST_BASH_CONFIG, type HostBashConfig } from "./config.ts";
+import { DEFAULT_HOST_BASH_CONFIG, type HostBashConfig, isPlainAbsolutePath } from "./config.ts";
 
 const shell = "/bin/bash";
 const refusal = "Host command refused.";
@@ -30,16 +30,18 @@ function quoted(value: string) {
 class ApprovalRefused extends Error {}
 class HostCommandStopped extends Error {}
 
-const maxPromptLines = 32;
-const maxPromptChars = 2200;
-// Rows Pi's selector adds around the title: borders, spacers, two choices and the key hint.
+// The prompt is sized for a classic 80x24 terminal rather than measured, so
+// the check is deterministic. Pi's selector adds 9 rows around the title
+// (borders, spacers, two choices, key hint); 4 rows are kept for its footer.
+const assumedColumns = 80;
+const assumedRows = 24;
 const selectorRows = 9;
-// Rows kept free below the selector for Pi's footer and status lines.
 const footerRows = 4;
+const maxTitleRows = assumedRows - selectorRows - footerRows;
 
-// Terminal rows the approval prompt needs, wrapped exactly as Pi's selector title is.
-export function promptRows(title: string, columns: number) {
-  return new Text(title, 1, 0).render(columns).length + selectorRows + footerRows;
+// Rows the selector title takes at the assumed width, wrapped as Pi renders it.
+export function titleRows(title: string) {
+  return new Text(title, 1, 0).render(assumedColumns).length;
 }
 
 async function approve(
@@ -51,35 +53,26 @@ async function approve(
   signal: AbortSignal,
 ) {
   const output = options.outputBytes
-    ? `last ${options.outputBytes} bytes of stdout/stderr are returned to the agent`
-    : "only the exit status is returned to the agent";
+    ? `agent sees last ${options.outputBytes} bytes of output`
+    : "agent sees exit status only";
   const header = [
-    "Run outside the OS sandbox?",
-    "Host files and network are accessible. Changes can persist.",
-    `Limit: ${options.timeoutSeconds}s; ${output}.`,
-    "Shell: " + shell,
-    "PATH (JSON): " + quoted(path),
-    "CWD (JSON): " + quoted(cwd),
+    "Run outside the OS sandbox? Host files and network are reachable.",
+    `${shell}, limit ${options.timeoutSeconds}s, ${output}.`,
+    "CWD: " + quoted(cwd),
+    "PATH: " + quoted(path),
   ];
   const shown = command.split("\n").map(quoted);
-  const title = [...header, "Command (JSON-quoted lines): " + shown.join("\n")].join("\n");
-  const lines = title.split("\n").length;
-  const { rows, columns } = process.stdout;
-  const needed = rows && columns ? promptRows(title, columns) : Infinity;
-  // The operator must be able to read the whole command on one screen, so an
-  // oversized one goes back to the agent instead of reaching the operator.
-  if (lines > maxPromptLines || title.length > maxPromptChars || !rows || needed > rows) {
-    const commandLines = maxPromptLines - header.length;
-    const commandChars = maxPromptChars - (title.length - shown.join("\n").length);
-    const screen =
-      rows && columns
-        ? `With wrapping, the prompt needs ${needed} rows but the operator's terminal has ${rows} rows and ${columns} columns. `
-        : "The operator's terminal size is unknown. ";
+  const title = [...header, "Command: " + shown.join("\n")].join("\n");
+  const rows = titleRows(title);
+  // The operator must be able to read the whole command, so an oversized one
+  // goes back to the agent instead of reaching the operator.
+  if (rows > maxTitleRows) {
+    const available = Math.max(0, maxTitleRows - titleRows(header.join("\n")));
     throw new ApprovalRefused(
-      `Host command refused before prompting: command too long. ` +
-        `As shown to the operator it is ${shown.length} lines and ${shown.join("\n").length} characters (JSON-quoted); ` +
-        `the limit for this call is at most ${commandLines} lines and ${commandChars} characters, and the whole prompt must fit on the operator's screen. ` +
-        screen +
+      "Host command refused before prompting: command too long. " +
+        `The approval prompt must fit an ${assumedColumns}x${assumedRows} terminal, which leaves ${maxTitleRows} rows for its text. ` +
+        `With this call's CWD and PATH, the command gets ${available} rows of ${assumedColumns - 2} columns; ` +
+        `as shown (JSON-quoted) it has ${shown.length} ${shown.length === 1 ? "line" : "lines"} and needs ${rows - (maxTitleRows - available)} rows. ` +
         "The operator could not read all of it. " +
         "Shorten the command (fewer and shorter lines) and call again: split it into several bash_with_human_approval calls, " +
         "remove comments and blank lines, or run the parts that do not need the host in ordinary sandboxed bash. " +
@@ -120,17 +113,25 @@ function resolved(path: string) {
   }
 }
 
-// System directories first so configured entries cannot shadow them. Entries in
-// the workspace or temp directories are dropped: sandboxed Bash can write there.
-export function hostPath(extraPath: readonly string[], cwd: string) {
-  const writable = [cwd, "/tmp", tmpdir()]
+// System directories first so configured entries cannot shadow them. Entries
+// in the workspace or temp directories are dropped because sandboxed Bash can
+// write there. Each kept entry is passed as the canonical path it was checked as.
+export function hostPath(
+  extraPath: readonly string[],
+  cwd: string,
+  writableRoots: readonly string[] = ["/tmp", tmpdir()],
+) {
+  const writable = [cwd, ...writableRoots]
     .flatMap((dir) => [resolve(dir), resolved(dir)])
     .filter((dir): dir is string => dir !== undefined);
-  const extra = extraPath.filter((entry) => {
+  const extra: string[] = [];
+  for (const entry of extraPath) {
+    if (!isPlainAbsolutePath(entry)) continue;
     const real = resolved(entry);
-    if (real === undefined) return false;
-    return !writable.some((dir) => within(dir, resolve(entry)) || within(dir, real));
-  });
+    if (real === undefined || real.includes(":")) continue;
+    if (writable.some((dir) => within(dir, entry) || within(dir, real))) continue;
+    if (!extra.includes(real)) extra.push(real);
+  }
   return [systemPath, ...extra].join(":");
 }
 
@@ -198,7 +199,7 @@ export function registerUnsandboxBash(
       "Typical signs: 'Operation not permitted', 'Permission denied' outside the workspace, blocked network, 'command not found' for a tool installed on the host (docker, brew, gcloud), " +
       "an unreachable daemon or socket, or missing or invalid credentials (gh, git, cloud CLIs, keychain). " +
       "Every call prompts the operator, so do not use it for work the sandbox can do. " +
-      "Keep the command short and self-contained: a command over about 25 lines or 2,000 characters, or one whose prompt does not fit the operator's terminal, is refused without prompting and must be shortened or split. " +
+      "Keep the command short and self-contained: the approval prompt must fit an 80x24 terminal, so a command over about 6 short lines is refused without prompting and must be shortened or split. " +
       "Runs non-interactively with stdin closed, a minimal PATH and environment, and a time limit. " +
       "Returns the exit status and, when enabled, the tail of combined stdout/stderr.",
     promptSnippet: "Ask the operator to run one Bash command outside the sandbox",

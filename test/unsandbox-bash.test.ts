@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
-import test, { type TestContext } from "node:test";
+import test from "node:test";
 
 import assert from "node:assert/strict";
 
@@ -16,22 +16,7 @@ import {
   mergeConfigLayers,
   resolveHostBashConfig,
 } from "../src/config.ts";
-import { hostPath, promptRows, registerUnsandboxBash, within } from "../src/unsandbox-bash.ts";
-
-function fakeTerminal(t: TestContext, rows = 100, columns = 200) {
-  for (const [key, value] of [
-    ["rows", rows],
-    ["columns", columns],
-  ] as const) {
-    const previous = Object.getOwnPropertyDescriptor(process.stdout, key);
-    Object.defineProperty(process.stdout, key, { configurable: true, value });
-    t.after(() =>
-      previous
-        ? Object.defineProperty(process.stdout, key, previous)
-        : Reflect.deleteProperty(process.stdout, key),
-    );
-  }
-}
+import { hostPath, titleRows, registerUnsandboxBash, within } from "../src/unsandbox-bash.ts";
 
 test("bash_with_human_approval requires one current affirmative terminal approval", async (t) => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-approval-")));
@@ -45,7 +30,6 @@ test("bash_with_human_approval requires one current affirmative terminal approva
         : Reflect.deleteProperty(stream, "isTTY"),
     );
   }
-  fakeTerminal(t);
   let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
   const host = registerUnsandboxBash(
     {
@@ -116,7 +100,7 @@ test("bash_with_human_approval requires one current affirmative terminal approva
   pending = run();
   assert.ok(title.includes(JSON.stringify(cwd)) && title.includes(JSON.stringify(command)));
   assert.deepEqual(choices, ["Deny", "Allow once"]);
-  assert.match(title, /Limit: 60s; last 16384 bytes of stdout\/stderr are returned/);
+  assert.match(title, /limit 60s, agent sees last 16384 bytes of output/);
   choose("Allow once");
   assert.deepEqual((await pending).details, { exitCode: 0 });
   assert.equal(launch.mock.callCount(), 1);
@@ -142,44 +126,26 @@ test("bash_with_human_approval requires one current affirmative terminal approva
   await assert.rejects(pending, /approval timed out/);
   timeout.mock.restore();
   // Oversized commands go back to the agent without prompting the operator.
+  // Here the header takes 4 of the 11 title rows an 80x24 terminal leaves.
   const before = prompts;
-  const multiline = Array.from({ length: 27 }, (_, i) => `# line ${i}`).join("\n");
+  const lines = (n: number) => Array.from({ length: n }, (_, i) => `echo ${i}`).join("\n");
   await assert.rejects(
-    run(undefined, multiline),
-    /refused before prompting: command too long\. As shown to the operator it is 27 lines .* the limit for this call is at most 26 lines/,
+    run(undefined, lines(8)),
+    /refused before prompting: command too long\. The approval prompt must fit an 80x24 terminal, which leaves 11 rows .* the command gets 7 rows of 78 columns; as shown \(JSON-quoted\) it has 8 lines and needs 8 rows/,
   );
+  // One long line wraps at the assumed width.
   await assert.rejects(
-    run(undefined, "# " + "x".repeat(2500)),
-    /command too long.*Shorten the command/,
+    run(undefined, "echo " + "y".repeat(600)),
+    /1 line and needs \d+ rows.*Shorten the command/,
   );
   assert.equal(prompts, before);
   // The largest command that fits is still prompted in full.
-  const fits = Array.from({ length: 26 }, (_, i) => `# line ${i}`).join("\n");
-  pending = run(undefined, fits);
+  pending = run(undefined, lines(7));
   assert.equal(prompts, before + 1);
-  assert.ok(title.includes(JSON.stringify("# line 25")));
+  assert.equal(titleRows(title), 11);
+  assert.ok(title.includes(JSON.stringify("echo 6")));
   choose("Deny");
   await assert.rejects(pending, /refused/);
-
-  // The rendered prompt must fit the operator's terminal, including wrapping.
-  const shortCommand = Array.from({ length: 12 }, (_, i) => `echo ${i}`).join("\n");
-  assert.ok(promptRows(shortCommand, 80) > 12);
-  Object.defineProperty(process.stdout, "rows", { configurable: true, value: 24 });
-  await assert.rejects(
-    run(undefined, shortCommand),
-    /command too long[\s\S]*needs \d+ rows but the operator's terminal has 24 rows/,
-  );
-  // About 1,900 characters wrap to more than 60 rows at 30 columns.
-  Object.defineProperty(process.stdout, "rows", { configurable: true, value: 60 });
-  Object.defineProperty(process.stdout, "columns", { configurable: true, value: 30 });
-  await assert.rejects(
-    run(undefined, "echo " + "y".repeat(1700)),
-    /terminal has 60 rows and 30 columns/,
-  );
-  Object.defineProperty(process.stdout, "columns", { configurable: true, value: undefined });
-  await assert.rejects(run(undefined, "true"), /terminal size is unknown/);
-  Object.defineProperty(process.stdout, "rows", { configurable: true, value: 100 });
-  Object.defineProperty(process.stdout, "columns", { configurable: true, value: 200 });
   assert.equal(prompts, before + 1);
   assert.equal(launch.mock.callCount(), 1);
 });
@@ -208,7 +174,6 @@ test("bash_with_human_approval refuses when hostBash is disabled", async (t) => 
         : Reflect.deleteProperty(stream, "isTTY"),
     );
   }
-  fakeTerminal(t);
   host.start(ctx);
   t.after(() => host.stop());
   await assert.rejects(
@@ -221,7 +186,12 @@ test("bash_with_human_approval refuses when hostBash is disabled", async (t) => 
 test("hostBash config is global-only and validated", () => {
   const merged = mergeConfigLayers(
     DEFAULT_CONFIG,
-    { hostBash: { enabled: true, extraPath: ["/opt/homebrew/bin", "relative", "/a:/b"] } },
+    {
+      hostBash: {
+        enabled: true,
+        extraPath: ["/opt/homebrew/bin", "relative", "/a:/b", "/a/../b", "/a/./b", "/a//b", "/a/"],
+      },
+    },
     { hostBash: { enabled: false, extraPath: ["/evil"], timeoutSeconds: 3000 } },
   );
   assert.deepEqual(merged.hostBash, {
@@ -266,23 +236,35 @@ test("within treats names starting with .. as inside", () => {
   assert.equal(within("/ws", "/other"), false);
 });
 
-test("hostPath resolves missing entries through their nearest existing ancestor", () => {
-  const base = realpathSync(mkdtempSync(join(homedir(), ".pi-host-path-")));
+test("hostPath checks entries where the OS would resolve them", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-path-")));
   try {
     const ws = join(base, "real", "ws");
-    mkdirSync(ws, { recursive: true });
+    mkdirSync(join(ws, "sub"), { recursive: true });
     symlinkSync(join(base, "real"), join(base, "alias"));
+    symlinkSync(join(ws, "sub"), join(base, "link"));
+    mkdirSync(join(base, "tools", "bin"), { recursive: true });
+    symlinkSync(join(base, "tools"), join(base, "tools-link"));
     assert.equal(
       hostPath(
         [
+          // Missing entry under a symlinked workspace path.
           join(base, "alias", "ws", "missing-bin"),
           join(base, "alias", "ws"),
           join(ws, "..tools", "bin"),
+          // The OS follows "link" before "..", landing in the workspace.
+          base + "/link/../evil",
+          base + "/outside/./bin",
+          base + "/outside//bin",
+          base + "/outside/bin/",
           join(base, "outside", "bin"),
+          // Kept entries are passed as the canonical path that was checked.
+          join(base, "tools-link", "bin"),
         ],
         ws,
+        [],
       ),
-      "/usr/bin:/bin:" + join(base, "outside", "bin"),
+      ["/usr/bin:/bin", join(base, "outside", "bin"), join(base, "tools", "bin")].join(":"),
     );
   } finally {
     rmSync(base, { recursive: true, force: true });

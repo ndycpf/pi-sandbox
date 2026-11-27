@@ -187,7 +187,8 @@ restart Pi after enabling it.
 {
   "hostBash": {
     "enabled": true,
-    // Appended after /usr/bin:/bin; a leading "~/" or "$HOME/" is expanded. Entries in the workspace or temp directory are dropped.
+    // Absolute, normalized paths (no "." or ".."), appended after /usr/bin:/bin.
+    // A leading "~/" or "$HOME/" is expanded. Entries in the workspace or temp directory are dropped.
     "extraPath": ["/opt/homebrew/bin", "/usr/local/bin", "$HOME/.docker/bin"],
     // Execution limit for one command (1-3600, default 60).
     "timeoutSeconds": 300,
@@ -202,11 +203,13 @@ While the sandbox is active, ordinary `bash` still runs inside it. The
 interactive Linux/macOS CLI shows the time limit, how much output the agent
 will see, the shell, PATH, resolved working directory and JSON-quoted command
 lines in Pi's standard selector. **Deny** is selected first. **Allow once** runs
-the command once. A command whose prompt would exceed 32 lines or 2,200
-characters (about 25 command lines), or would not fit your terminal window once
-wrapped, never reaches you: the agent gets a "command
-too long" error with the limit and is asked to shorten or split it, so you never
-approve text you could not see. Escape cancels. RPC, print, JSON and non-TTY sessions cannot approve.
+the command once. The prompt is sized for an 80x24 terminal: its text, wrapped
+at 80 columns, may take 11 rows, which leaves about 7 short command lines after
+the CWD and PATH lines. A longer command never reaches you: the agent gets a
+"command too long" error with the budget and is asked to shorten or split it, so
+you do not approve text you could not see in such a terminal. A window smaller
+than 80x24, or many extension widgets below the prompt, can still push the top
+of the prompt off screen; keep the terminal at least that size. Escape cancels. RPC, print, JSON and non-TTY sessions cannot approve.
 
 The command runs in a fresh `/bin/bash` with stdin closed, the PATH above and
 the operator's HOME. It has the host user's filesystem and network access.

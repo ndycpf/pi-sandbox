@@ -176,17 +176,50 @@ export function registerHostBash(
         id: string;
         lifetime: AbortController;
         denials: number;
+        /** Why auto-review is off for the rest of this session, if it is. */
+        paused?: "denials" | "operator";
       }
     | undefined;
   const showStatus = (ctx: ExtensionContext) => {
     const review = config(ctx.cwd).review;
     if (review.mode !== "auto") return ctx.ui?.setStatus?.("host-bash", undefined);
-    const paused = session && session.denials >= maxDenials;
     ctx.ui?.setStatus?.(
       "host-bash",
-      paused ? "host_bash: human (auto-review paused)" : `host_bash: auto-review (${review.model})`,
+      session?.paused
+        ? "host_bash: human (auto-review paused)"
+        : `host_bash: auto-review (${review.model})`,
     );
   };
+
+  pi.registerCommand?.("host-auto", {
+    description: "Pause or resume host_bash auto-review for this session: /host-auto [on|off]",
+    handler: async (args, ctx) => {
+      const review = config(ctx.cwd).review;
+      const arg = args.trim();
+      if (review.mode !== "auto") {
+        ctx.ui.notify(
+          'host_bash auto-review is not configured. Set hostBash.review.mode to "auto" in the global sandbox.json.',
+          "info",
+        );
+        return;
+      }
+      if (session && arg === "off") session.paused = "operator";
+      else if (session && arg === "on") {
+        session.paused = undefined;
+        session.denials = 0;
+      } else if (arg) {
+        ctx.ui.notify("Usage: /host-auto [on|off]", "warning");
+        return;
+      }
+      showStatus(ctx);
+      ctx.ui.notify(
+        session?.paused
+          ? "host_bash auto-review is paused for this session; every call is prompted."
+          : `host_bash auto-review is on (${review.model}).`,
+        "info",
+      );
+    },
+  });
 
   pi.registerTool({
     name: "host_bash",
@@ -262,7 +295,7 @@ export function registerHostBash(
         lifetime.throwIfAborted();
         const review = options.review;
         let approvedBy: "operator" | "reviewer" = "operator";
-        if (review.mode === "auto" && review.model && active.denials < maxDenials) {
+        if (review.mode === "auto" && review.model && !active.paused) {
           const request = latestUserRequest(ctx);
           const verdict = await reviewCommand(
             makeReviewer(ctx, review.model),
@@ -299,10 +332,11 @@ export function registerHostBash(
           } else if (verdict.decision === "deny") {
             active.denials++;
             const paused = active.denials >= maxDenials;
+            if (paused) active.paused = "denials";
             ctx.ui.notify(
               `host_bash denied by auto-review: ${verdict.reason}` +
                 (paused
-                  ? `\nAuto-review paused for this session after ${maxDenials} denials in a row; you will be asked instead.`
+                  ? `\nAuto-review paused for this session after ${maxDenials} denials in a row; you will be asked instead. /host-auto on resumes it.`
                   : ""),
               "warning",
             );

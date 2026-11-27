@@ -269,6 +269,10 @@ answers `allow`, `deny` or `ask`:
   After 3 denials in a row, auto-review pauses for the rest of the session and
   every call is prompted.
 
+`/host-auto off` pauses auto-review for the current session (every call is
+prompted), `/host-auto on` resumes it, and `/host-auto` shows the state. The
+command cannot turn auto-review on when the global config does not.
+
 Some commands always come to you whatever the reviewer would say: `sudo` and
 similar, `rm` with `-r` or `-f`, piping into a shell, disk-level tools, paths
 or commands that look like credentials (`~/.ssh`, `~/.aws`, keychain,

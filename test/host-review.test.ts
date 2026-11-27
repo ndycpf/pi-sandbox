@@ -245,9 +245,16 @@ function fixture(t: TestContext, reviewer: Reviewer) {
     );
   }
   let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
+  let command!: Parameters<ExtensionAPI["registerCommand"]>[1];
   const logFile = join(cwd, "review.log");
   const host = registerHostBash(
-    { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,
+    {
+      registerTool: (def: typeof tool) => (tool = def),
+      registerCommand: (name: string, def: typeof command) => {
+        assert.equal(name, "host-auto");
+        command = def;
+      },
+    } as unknown as ExtensionAPI,
     () => true,
     () => ({ ...DEFAULT_HOST_BASH_CONFIG, enabled: true, review: auto }),
     { reviewer: () => reviewer, logFile },
@@ -276,7 +283,9 @@ function fixture(t: TestContext, reviewer: Reviewer) {
   t.after(() => host.stop());
   const run = (command: string, reason?: string) =>
     tool.execute("t", { command, reason }, undefined, undefined, ctx);
-  return { cwd, run, state, logFile };
+  const hostAuto = (args: string) =>
+    command.handler(args, ctx as unknown as Parameters<typeof command.handler>[1]);
+  return { cwd, run, state, logFile, hostAuto };
 }
 
 test(
@@ -285,7 +294,7 @@ test(
   async (t) => {
     let verdict: unknown = { decision: "allow", risk: "low", reason: "harmless" };
     let seen: ReviewInput | undefined;
-    const { cwd, run, state, logFile } = fixture(t, async (_system, user) => {
+    const { cwd, run, state, logFile, hostAuto } = fixture(t, async (_system, user) => {
       seen = JSON.parse(user);
       return JSON.stringify(verdict);
     });
@@ -328,6 +337,21 @@ test(
     state.choice = "Deny";
     await assert.rejects(run("true"), /refused/);
     assert.equal(state.prompts, 2);
+    // An operator approval does not end the pause.
+    state.choice = "Allow once";
+    await run("true");
+    await run("true");
+    assert.equal(state.prompts, 4);
+
+    // /host-auto resumes and pauses auto-review.
+    await hostAuto("on");
+    assert.match(state.status ?? "", /auto-review \(fake/);
+    assert.deepEqual((await run("true")).details, { exitCode: 0, approvedBy: "reviewer" });
+    assert.equal(state.prompts, 4);
+    await hostAuto("off");
+    assert.match(state.status ?? "", /paused/);
+    assert.deepEqual((await run("true")).details, { exitCode: 0, approvedBy: "operator" });
+    assert.equal(state.prompts, 5);
 
     const log = readFileSync(logFile, "utf-8")
       .trim()
@@ -335,7 +359,7 @@ test(
       .map((line) => JSON.parse(line));
     assert.deepEqual(
       log.map((entry) => entry.decision),
-      ["allow", "ask", "deny", "deny", "deny"],
+      ["allow", "ask", "deny", "deny", "deny", "allow"],
     );
     assert.equal(log[0].command, "printf ran > out");
   },

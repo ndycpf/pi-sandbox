@@ -310,12 +310,12 @@ test("review log is JSONL and rotates", (t) => {
   assert.equal(JSON.parse(readFileSync(log, "utf-8")).command, "pwd");
 });
 
-function fixture(t: TestContext, reviewer: Reviewer) {
+function fixture(t: TestContext, reviewer: Reviewer, mode: "tui" | "rpc" = "tui") {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-review-")));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   for (const stream of [process.stdin, process.stdout]) {
     const previous = Object.getOwnPropertyDescriptor(stream, "isTTY");
-    Object.defineProperty(stream, "isTTY", { configurable: true, value: true });
+    Object.defineProperty(stream, "isTTY", { configurable: true, value: mode === "tui" });
     t.after(() =>
       previous
         ? Object.defineProperty(stream, "isTTY", previous)
@@ -334,18 +334,21 @@ function fixture(t: TestContext, reviewer: Reviewer) {
     prompts: 0,
     choice: "Deny",
     notes: [] as string[],
+    timeouts: [] as (number | undefined)[],
     status: "" as string | undefined,
   };
   const ctx = {
     cwd,
-    mode: "tui",
+    mode,
     hasUI: true,
     sessionManager: {
       getSessionId: () => "fixture",
       getBranch: () => [{ type: "message", message: { role: "user", content: "check git" } }],
     },
     ui: {
-      select: async () => (state.prompts++, state.choice),
+      select: async (_title: string, _options: string[], opts: { timeout?: number }) => (
+        state.prompts++, state.timeouts.push(opts?.timeout), state.choice
+      ),
       notify: (text: string) => state.notes.push(text),
       setStatus: (_key: string, text?: string) => (state.status = text),
     },
@@ -565,4 +568,25 @@ test("modelReviewer runs read and ls calls before the answer", async (t) => {
   assert.equal(verdict.decision, "deny");
   assert.deepEqual(verdict.checks, [{ tool: "read", path: "deploy.sh", ok: true }]);
   assert.equal(faux.state.callCount, 2);
+});
+
+test("auto-review works for an RPC client without a TTY", { skip: !supported }, async (t) => {
+  let verdict: unknown = { outcome: "allow" };
+  const { cwd, run, state } = fixture(t, async () => JSON.stringify(verdict), "rpc");
+  assert.deepEqual((await run("printf rpc > out")).details, {
+    exitCode: 0,
+    approvedBy: "reviewer",
+  });
+  assert.equal(readFileSync(join(cwd, "out"), "utf-8"), "rpc");
+  assert.equal(state.prompts, 0);
+  assert.match(state.notes.at(-1) ?? "", /auto-approved/);
+  // Fallback goes to the RPC client's dialog, with the time Pi waits.
+  verdict = "not json";
+  state.choice = "Allow once";
+  assert.deepEqual((await run("true")).details, { exitCode: 0, approvedBy: "operator" });
+  assert.equal(state.prompts, 1);
+  assert.ok(Number.isInteger(state.timeouts[0]) && state.timeouts[0]! > 0);
+  verdict = { outcome: "deny", rationale: "no" };
+  await assert.rejects(run("true"), /denied by the automatic reviewer: no/);
+  assert.equal(state.prompts, 1);
 });

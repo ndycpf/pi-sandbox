@@ -45,6 +45,25 @@ function quoted(value: string) {
 }
 
 class ApprovalRefused extends Error {}
+
+// Pi's TUI on a real terminal, or an RPC client trusted to relay a person's
+// answer (hostBash.approvalModes). JSON and print modes cannot prompt.
+function approvalChannel(ctx: ExtensionContext, options: HostBashConfig) {
+  if (!ctx.hasUI || !(options.approvalModes as string[]).includes(ctx.mode)) return false;
+  return ctx.mode === "rpc" || (!!process.stdin.isTTY && !!process.stdout.isTTY);
+}
+
+function noChannel(ctx: ExtensionContext) {
+  const why =
+    ctx.mode === "rpc" && ctx.hasUI
+      ? 'Pi runs in RPC mode and the global hostBash.approvalModes does not include "rpc"'
+      : `this Pi session (mode "${ctx.mode}") cannot show the operator an approval prompt`;
+  return new ApprovalRefused(
+    `Host command refused before prompting: ${why}. ` +
+      "Report this to the operator instead of saying they denied it; do not retry unless they change the setup.",
+  );
+}
+
 class HostCommandStopped extends Error {}
 
 // The prompt is sized for a classic 80x24 terminal rather than measured, so
@@ -96,8 +115,12 @@ function promptTitle(command: string, cwd: string, options: HostBashConfig) {
   return title;
 }
 
-async function approve(ctx: ExtensionContext, title: string, signal: AbortSignal) {
-  const choice = await ctx.ui.select(title, ["Deny", "Allow once"], { signal });
+async function approve(ctx: ExtensionContext, title: string, signal: AbortSignal, expires: number) {
+  // RPC clients get the remaining approval time so they can expire their card;
+  // the TUI selector would add a countdown to the title and change its height.
+  const timeout =
+    ctx.mode === "rpc" ? Math.max(1, Math.ceil(expires - performance.now())) : undefined;
+  const choice = await ctx.ui.select(title, ["Deny", "Allow once"], { signal, timeout });
   if (signal.aborted || choice === undefined) {
     throw new ApprovalRefused(
       signal.reason?.name === "TimeoutError"
@@ -206,7 +229,7 @@ export function registerHostBash(
     name: "host_bash",
     label: "Host Bash",
     description:
-      "Run one Bash command on the host, outside the OS sandbox, after the human operator approves it in the interactive CLI. " +
+      "Run one Bash command on the host, outside the OS sandbox, after the human operator approves it in Pi's interactive CLI or RPC client. " +
       "Ordinary bash runs inside the sandbox, which blocks paths outside the workspace, most network hosts, local services and credential stores. " +
       "Use this tool when a sandboxed command fails or gives misleading results because of that, or when the task needs something only the host has. " +
       "Typical signs: 'Operation not permitted', 'Permission denied' outside the workspace, blocked network, 'command not found' for a tool installed on the host (docker, brew, gcloud), " +
@@ -233,16 +256,23 @@ export function registerHostBash(
     }),
     async execute(_id, { command, reason }, abort, _update, ctx) {
       const active = session;
+      const options = config(ctx.cwd);
       const current = () =>
         active &&
         active === session &&
         ready() &&
-        ctx.mode === "tui" &&
-        ctx.hasUI &&
-        process.stdin.isTTY &&
-        process.stdout.isTTY &&
+        approvalChannel(ctx, options) &&
         ctx.sessionManager === active.manager &&
         active.id === ctx.sessionManager.getSessionId();
+      if (
+        options.enabled &&
+        active &&
+        active === session &&
+        ready() &&
+        !approvalChannel(ctx, options)
+      ) {
+        throw noChannel(ctx);
+      }
       if (
         !current() ||
         !active ||
@@ -255,7 +285,6 @@ export function registerHostBash(
       ) {
         throw new Error(refusal);
       }
-      const options = config(ctx.cwd);
       if (!options.enabled) throw new Error(refusal);
       busy = true;
       let fd: number | undefined;
@@ -337,7 +366,7 @@ export function registerHostBash(
           const approval = AbortSignal.any([lifetime, AbortSignal.timeout(deadline)]);
           approval.throwIfAborted();
           if (
-            (await approve(ctx, title, approval)) !== true ||
+            (await approve(ctx, title, approval, expires)) !== true ||
             approval.aborted ||
             performance.now() >= expires
           )

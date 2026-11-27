@@ -51,7 +51,8 @@ export function permissionPromptTimeoutMs(timeoutSeconds: unknown): number | und
   ) {
     return undefined;
   }
-  return Math.min(resolvedTimeoutSeconds * 1000, MAX_TIMER_DELAY_MS);
+  // Whole milliseconds: AbortSignal.timeout rejects fractions such as 1000.9999999999999.
+  return Math.min(Math.ceil(resolvedTimeoutSeconds * 1000), MAX_TIMER_DELAY_MS);
 }
 
 export function permissionPromptRemainingSeconds(deadlineMs: number, nowMs = Date.now()): number {
@@ -114,7 +115,10 @@ export async function showPermissionPrompt(
   timeoutSeconds?: number,
 ): Promise<PermissionPromptResult> {
   const aborted: PermissionPromptResult = { action: "abort", value: originalValue };
-  if (!ctx.hasUI || (ctx.mode !== undefined && ctx.mode !== "tui")) return aborted;
+  // TUI draws the inline widget; RPC clients get plain select/confirm dialogs.
+  if (!ctx.hasUI || (ctx.mode !== undefined && ctx.mode !== "tui" && ctx.mode !== "rpc")) {
+    return aborted;
+  }
 
   const queue = getPromptQueue(pi);
   const operationSignal = ctx.signal;
@@ -139,6 +143,17 @@ export async function showPermissionPrompt(
     const ready = await Promise.race([previous.then(() => true), cancelled]);
     signal.removeEventListener("abort", onAbort);
     if (!ready || signal.aborted) return aborted;
+    if (ctx.mode === "rpc") {
+      return await dialogPermissionPrompt(
+        pi,
+        ctx,
+        title,
+        originalValue,
+        validateValue,
+        signal,
+        timeoutSeconds,
+      );
+    }
     return await renderPermissionPrompt(
       pi,
       ctx,
@@ -152,6 +167,52 @@ export async function showPermissionPrompt(
     signal.removeEventListener("abort", onAbort);
     release();
   }
+}
+
+/**
+ * RPC mode has no terminal, so the inline widget cannot render. The same
+ * choices go through the client's select dialog; saving a rule to a config file
+ * needs a second confirmation, as the TUI asks for Enter. The rule is the
+ * blocked value itself (editing it needs the TUI).
+ */
+async function dialogPermissionPrompt(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  title: string,
+  originalValue: string,
+  validateValue: (value: string) => string | null,
+  signal: AbortSignal,
+  timeoutSeconds?: number,
+): Promise<PermissionPromptResult> {
+  const aborted: PermissionPromptResult = { action: "abort", value: originalValue };
+  pi.events.emit("request-attention", { message: "Sandbox permission required" });
+  const timeoutMs = permissionPromptTimeoutMs(timeoutSeconds);
+  const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
+  const dialog =
+    timeoutMs === undefined ? signal : AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
+  // The client gets the time left so it can expire its card when Pi stops waiting.
+  const remaining = () =>
+    deadline === undefined ? undefined : Math.max(1, Math.ceil(deadline - performance.now()));
+  // The abort timer can fire after a late answer is processed, so check the clock too.
+  const expired = () => dialog.aborted || (deadline !== undefined && performance.now() >= deadline);
+  const options = permissionOptions(ctx.cwd);
+  const labels = options.map((option) =>
+    option.hint ? `${option.label} ${option.hint}` : option.label,
+  );
+  const choice = await ctx.ui.select(title, labels, { signal: dialog, timeout: remaining() });
+  const option = choice === undefined ? undefined : options[labels.indexOf(choice)];
+  if (!option || option.action === "abort" || expired()) return aborted;
+  if (validateValue(originalValue) !== null) return aborted;
+  if (option.confirm) {
+    const confirmed = await ctx.ui.confirm(
+      `${option.label}?`,
+      `Save "${originalValue}" ${option.hint ?? ""}`.trim(),
+      { signal: dialog, timeout: remaining() },
+    );
+    if (confirmed !== true) return aborted;
+  }
+  if (expired()) return aborted;
+  return { action: option.action, value: originalValue };
 }
 
 type PermissionWidget = Component & { focused: boolean; dispose(): void };

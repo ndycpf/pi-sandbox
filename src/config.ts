@@ -66,14 +66,24 @@ export type HostBashConfig = {
   timeoutSeconds: number;
   /** Bytes of combined stdout/stderr tail returned to the agent; 0 returns exit status only. */
   outputBytes: number;
+  /**
+   * Pi modes whose UI may answer the approval prompt. "rpc" trusts the RPC
+   * client (for example Orca) to show the prompt to a person and relay only
+   * that person's answer.
+   */
+  approvalModes: HostBashApprovalMode[];
   /** Who approves a call: the operator only, or an LLM reviewer first. */
   review: HostReviewConfig;
 };
+
+export const HOST_BASH_APPROVAL_MODES = ["tui", "rpc"] as const;
+export type HostBashApprovalMode = (typeof HOST_BASH_APPROVAL_MODES)[number];
 
 export const DEFAULT_HOST_BASH_CONFIG: HostBashConfig = {
   enabled: false,
   timeoutSeconds: 60,
   outputBytes: 16 * 1024,
+  approvalModes: ["tui", "rpc"],
   review: DEFAULT_HOST_REVIEW_CONFIG,
 };
 
@@ -87,10 +97,14 @@ function boundedInteger(value: unknown, min: number, max: number, fallback: numb
 export function resolveHostBashConfig(value: unknown): HostBashConfig {
   const raw = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
   const defaults = DEFAULT_HOST_BASH_CONFIG;
+  const modes = raw.approvalModes;
   return {
     enabled: raw.enabled === true,
     timeoutSeconds: boundedInteger(raw.timeoutSeconds, 1, 3600, defaults.timeoutSeconds),
     outputBytes: boundedInteger(raw.outputBytes, 0, 64 * 1024, defaults.outputBytes),
+    approvalModes: Array.isArray(modes)
+      ? HOST_BASH_APPROVAL_MODES.filter((mode) => modes.includes(mode))
+      : [...defaults.approvalModes],
     review: resolveHostReviewConfig(raw.review),
   };
 }

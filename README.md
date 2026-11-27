@@ -166,10 +166,10 @@ or set it to `0` to wait indefinitely. A timeout never grants permission.
 - Allow for this project — written to `.pi/sandbox.json`
 - Allow for all projects — written to Pi's global agent directory (by default, `~/.pi/agent/sandbox.json`; respects `PI_CODING_AGENT_DIR`)
 
-In RPC mode (`pi --mode rpc`, for example Orca's chat view) the same choices are
-sent to the client as a select dialog, and the two persistent choices ask for a
-second confirmation. The rule is the blocked value as shown; editing it needs the
-TUI. Print and JSON modes have no dialog, so a blocked request stays blocked.
+In non-TUI hosts with a UI, such as RPC mode (`pi --mode rpc`, for example Orca's
+chat view), the same choices are sent to the client as a select dialog. The rule
+is the blocked value as shown; editing it needs the TUI. Hosts without a UI have
+no dialog, so a blocked request stays blocked.
 
 **Session allowances** are held in memory only. They are never written to disk
 and the agent has no way to read or modify them. They are reset when the

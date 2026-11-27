@@ -9,6 +9,7 @@ import {
   CustomEditor,
   type ExtensionAPI,
   type ExtensionContext,
+  type ExtensionToolContext,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import assert from "node:assert/strict";
@@ -16,7 +17,11 @@ import { setImmediate } from "node:timers/promises";
 
 import extension from "../src/extension.ts";
 
-async function fixture(t: TestContext, enableAccessRequestTool: boolean) {
+async function fixture(
+  t: TestContext,
+  enableAccessRequestTool: boolean,
+  overrides: Record<string, unknown> = {},
+) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-sandbox-access-")));
   const agentDir = join(root, "agent");
   mkdirSync(agentDir);
@@ -31,6 +36,7 @@ async function fixture(t: TestContext, enableAccessRequestTool: boolean) {
         allowWrite: [join(root, "write")],
         denyWrite: [join(root, "write", "denied")],
       },
+      ...overrides,
     }),
   );
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -64,6 +70,8 @@ async function fixture(t: TestContext, enableAccessRequestTool: boolean) {
     isProjectTrusted: () => true,
     ui: {
       notify() {},
+      setStatus() {},
+      theme,
       onTerminalInput(handler: typeof input) {
         input = handler;
         return () => {
@@ -78,13 +86,15 @@ async function fixture(t: TestContext, enableAccessRequestTool: boolean) {
         widget = factory(tui, theme);
       },
     },
-  } as unknown as ExtensionContext;
+  } as unknown as ExtensionToolContext;
   extension(api);
   t.after(() => handlers.get("session_shutdown")!({}, ctx));
   await handlers.get("session_start")!({}, ctx);
   return {
     root,
+    ctx,
     tools,
+    handlers,
     prompts: () => prompts,
     send: (data: string) => {
       assert.ok(input, "Permission widget must be listening for input");
@@ -140,4 +150,34 @@ test("access tools report effective grants and avoid redundant or forbidden prom
   assert.deepEqual(updated.sessionGrants.readPaths, [join(f.root, "new")]);
   await request("read", join(f.root, "new", "another-file"));
   assert.equal(f.prompts(), 1);
+});
+
+test("network.disabled skips domain preflight and treats domain access requests as already allowed", async (t) => {
+  const f = await fixture(t, true, {
+    enabled: true,
+    network: {
+      disabled: true,
+      allowedDomains: ["allowed.example"],
+      deniedDomains: ["blocked.example"],
+    },
+  });
+  for (const target of ["unlisted.example", "blocked.example"]) {
+    const result = await f.execute("sandbox_request_access", {
+      kind: "domain",
+      target,
+      reason: "Unrestricted network when network.disabled is true",
+    });
+    assert.deepEqual(result.details, { kind: "domain", target, alreadyAllowed: true });
+  }
+  const toolCallResult = await f.handlers.get("tool_call")!(
+    { toolName: "bash", input: { command: "curl https://unlisted.example/data" } },
+    f.ctx,
+  );
+  assert.equal(toolCallResult, undefined);
+  const userBashResult = await f.handlers.get("user_bash")!(
+    { command: "curl https://unlisted.example/data", cwd: f.root },
+    f.ctx,
+  );
+  assert.equal(userBashResult?.result, undefined);
+  assert.equal(f.prompts(), 0);
 });

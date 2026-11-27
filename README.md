@@ -313,7 +313,10 @@ the model provider: `/proc`, `/sys`, `/dev`, `~/.pi/agent/auth.json`,
 `.netrc`, `.npmrc`, credentials files. Each path is checked after resolving
 symlinks, and the sandbox also denies the listed directories and the
 secret-named files under the working directory, so a symlink swapped after
-the check still cannot reach them. Two gaps remain: secret-named files outside
+the check still cannot reach them. These rules are rebuilt for every call; if
+the working directory has over 50,000 entries the reviewer cannot read
+anything, since its secret files cannot all be covered. Only the first 1 MiB
+of a file can be checked. Two gaps remain: secret-named files outside
 the working directory and those directories are refused by the path check
 only, and the sandbox mounts `/proc`, `/sys` and `/dev` itself (there the
 reviewer sees only its own process, whose environment holds just `PATH`,

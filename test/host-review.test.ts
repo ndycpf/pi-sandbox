@@ -32,6 +32,7 @@ import {
 import {
   isSecretPath,
   resolveReviewBinaries,
+  secretDenyPaths,
   type ReviewExec,
   type ReviewRequest,
   ReviewToolRunner,
@@ -605,7 +606,7 @@ test("reviewer read and ls run as shell commands, minus secrets", async (t) => {
   writeFileSync(join(work, "big"), Array.from({ length: 5000 }, (_, i) => `line ${i}`).join("\n"));
   const big = (await more.run("read", { path: "big" })).text;
   assert.ok(Buffer.byteLength(big) < 17 * 1024);
-  assert.match(big, /<truncated: 5000 lines; use offset/);
+  assert.match(big, /\n<truncated: use offset to read further \/>$/);
   assert.ok(
     (await more.run("read", { path: "big", offset: 4998 })).text.startsWith("line 4998\nline 4999"),
   );
@@ -636,6 +637,47 @@ test("reviewer read and ls run as shell commands, minus secrets", async (t) => {
     text: "Tool budget exhausted. Give your final answer now.",
     isError: true,
   });
+});
+
+test("reviewer output stays within its byte budget and its 1 MiB window", async (t) => {
+  const work = realpathSync(mkdtempSync(join(tmpdir(), "pi-review-budget-")));
+  t.after(() => rmSync(work, { recursive: true, force: true }));
+  // Over 1 MiB: the window ends mid-file, and later lines cannot be checked.
+  const line = "x".repeat(99);
+  writeFileSync(join(work, "huge"), Array.from({ length: 20_000 }, () => line).join("\n"));
+  const tools = new ReviewToolRunner(work, exec, bins);
+  const beyond = await tools.run("read", { path: "huge", offset: 15_000 });
+  assert.deepEqual(beyond, {
+    text: "<content past the first 1 MiB cannot be checked />",
+    isError: false,
+  });
+  const tail = (await tools.run("read", { path: "huge", offset: 10_484 })).text;
+  assert.match(tail, /^x{99}\n<truncated: content past the first 1 MiB cannot be checked \/>$/);
+  // Three 16 KiB reads and a long listing: the listing, notice included, fills
+  // the rest of the 64 KiB and no more.
+  for (let i = 0; i < 300; i++) writeFileSync(join(work, `file-${"n".repeat(100)}-${i}`), "");
+  let total = Buffer.byteLength(tail) + Buffer.byteLength(beyond.text);
+  for (let i = 0; i < 3; i++)
+    total += Buffer.byteLength((await tools.run("read", { path: "huge" })).text);
+  const listing = (await tools.run("ls", { path: "." })).text;
+  assert.match(listing, /\n<truncated: 301 entries \/>$/);
+  assert.ok(total + Buffer.byteLength(listing) <= 64 * 1024);
+  assert.equal(
+    (await tools.run("ls", { path: "." })).text,
+    "Tool budget exhausted. Give your final answer now.",
+  );
+});
+
+test("a secret-file walk that stops early refuses the read", (t) => {
+  const work = realpathSync(mkdtempSync(join(tmpdir(), "pi-review-walk-")));
+  t.after(() => rmSync(work, { recursive: true, force: true }));
+  mkdirSync(join(work, "a", "b"), { recursive: true });
+  writeFileSync(join(work, "a", "b", ".env"), "");
+  writeFileSync(join(work, "x"), "");
+  const done = secretDenyPaths(work);
+  assert.equal(done.complete, true);
+  assert.ok(done.paths.includes(join(work, "a", "b", ".env")));
+  assert.equal(secretDenyPaths(work, 2).complete, false);
 });
 
 test("reviewer binaries default to the usual paths and can be set", () => {

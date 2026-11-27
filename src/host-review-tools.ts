@@ -97,15 +97,16 @@ const maxWalkEntries = 50_000;
 /**
  * Secret paths for the sandbox to deny on every reviewer command, so a symlink
  * swapped after the path check still cannot reach them: the fixed secret
- * directories, and secret-named files under `cwd` (up to a bounded walk).
+ * directories, and secret-named files under `cwd`. `complete` is false when
+ * the walk stopped at its entry limit, and then nothing should be read.
  */
-export function secretDenyPaths(cwd: string) {
+export function secretDenyPaths(cwd: string, limit = maxWalkEntries) {
   const paths = secretDirs
     .filter((dir) => !pathOnlyDirs.has(dir))
     .map((dir) => canonicalizePath(dir, cwd));
   const pending = [cwd];
   let seen = 0;
-  while (pending.length && seen < maxWalkEntries) {
+  while (pending.length && seen < limit) {
     const dir = pending.pop()!;
     let handle;
     try {
@@ -114,11 +115,7 @@ export function secretDenyPaths(cwd: string) {
       continue;
     }
     try {
-      for (
-        let entry = handle.readSync();
-        entry && seen < maxWalkEntries;
-        entry = handle.readSync()
-      ) {
+      for (let entry = handle.readSync(); entry && seen < limit; entry = handle.readSync()) {
         seen++;
         const path = join(dir, entry.name);
         if (entry.isDirectory()) pending.push(path);
@@ -134,7 +131,7 @@ export function secretDenyPaths(cwd: string) {
       handle.closeSync();
     }
   }
-  return [...new Set(paths)];
+  return { paths: [...new Set(paths)], complete: !pending.length && seen < limit };
 }
 
 /** Whether `path`, after resolving symlinks, is a secret file the reviewer must not read. */
@@ -176,7 +173,6 @@ export class ReviewToolRunner {
     private readonly exec: ReviewExec | undefined,
     private readonly binaries: ReviewBinaries,
   ) {}
-  private denyRead?: string[];
 
   async run(name: string, args: Record<string, unknown>, signal?: AbortSignal) {
     const result = await this.attempt(name, args, signal);
@@ -191,7 +187,8 @@ export class ReviewToolRunner {
   private async attempt(name: string, args: Record<string, unknown>, signal?: AbortSignal) {
     const fail = (text: string) => ({ text, isError: true });
     this.calls++;
-    if (this.calls > maxToolCalls || this.bytes >= maxTotalBytes)
+    // Room is kept for at least a short answer and its truncation notice.
+    if (this.calls > maxToolCalls || maxTotalBytes - this.bytes < 256)
       return fail("Tool budget exhausted. Give your final answer now.");
     const path = typeof args.path === "string" && args.path ? args.path : undefined;
     if (!path) return fail("Missing path.");
@@ -209,11 +206,16 @@ export class ReviewToolRunner {
         ? ["-f", "a regular file", `${quote(program!)} -c ${readLimit}`]
         : ["-d", "a directory", `${quote(program!)} -1Ap`];
     const script = `if [ ! -e ${target} ]; then echo 'No such file.'; exit 3; elif [ ! ${test} ${target} ]; then echo 'Not ${kind}.'; exit 3; fi; exec ${command} -- ${target}`;
+    // Built for each call, so files that appeared since the last one are covered.
+    const secrets = secretDenyPaths(this.cwd);
+    if (!secrets.complete)
+      return fail(
+        `Refused: the working directory has over ${maxWalkEntries} entries, too many to protect secret files.`,
+      );
     let out: Awaited<ReturnType<ReviewExec>>;
     try {
-      this.denyRead ??= secretDenyPaths(this.cwd);
       out = await this.exec(
-        { command: script, cwd: this.cwd, shell: this.binaries.sh!, denyRead: this.denyRead },
+        { command: script, cwd: this.cwd, shell: this.binaries.sh!, denyRead: secrets.paths },
         signal,
       );
     } catch (error) {
@@ -221,33 +223,60 @@ export class ReviewToolRunner {
     }
     if (out.exitCode === 3) return fail(out.stdout.toString().trim());
     if (out.exitCode !== 0) return fail("Failed: not readable in the sandbox.");
+    const room = maxTotalBytes - this.bytes;
     const text =
       name === "read"
-        ? this.page(out.stdout, Number.isInteger(args.offset) ? (args.offset as number) : 0)
-        : this.listing(out.stdout);
+        ? page(
+            out.stdout,
+            Number.isInteger(args.offset) ? (args.offset as number) : 0,
+            Math.min(maxReadBytes, room),
+          )
+        : listing(out.stdout, room);
     this.bytes += Buffer.byteLength(text);
     return { text, isError: false };
   }
+}
 
-  // The sandbox read at most `readLimit` bytes; `offset` lines are skipped here.
-  private page(data: Buffer, offset: number) {
-    if (data.includes(0)) return "Binary file.";
-    const budget = Math.min(maxReadBytes, maxTotalBytes - this.bytes);
-    const lines = data.toString("utf-8").split("\n");
-    const body = Buffer.from(lines.slice(offset).join("\n"));
-    const shown = body
-      .subarray(0, budget)
-      .toString("utf-8")
-      .replace(/\uFFFD$/, "");
-    return body.length > budget || data.length >= readLimit
-      ? `${shown}\n<truncated: ${data.length >= readLimit ? "over " : ""}${lines.length} lines; use offset to read further />`
-      : shown;
-  }
+/** `text` cut to at most `bytes` bytes of UTF-8, without a split character. */
+function cut(text: string, bytes: number) {
+  const data = Buffer.from(text);
+  if (data.length <= bytes) return text;
+  return data
+    .subarray(0, Math.max(0, bytes))
+    .toString("utf-8")
+    .replace(/\uFFFD$/, "");
+}
 
-  private listing(data: Buffer) {
-    const entries = data.toString("utf-8").split("\n").filter(Boolean);
-    const shown = entries.slice(0, maxEntries);
-    if (entries.length > maxEntries) shown.push(`<truncated: ${entries.length} entries />`);
-    return shown.join("\n") || "(empty)";
+// The sandbox read at most `readLimit` bytes; `offset` lines are skipped here,
+// and the result, notices included, fits in `limit` bytes.
+function page(data: Buffer, offset: number, limit: number) {
+  if (data.includes(0)) return "Binary file.";
+  const partial = data.length >= readLimit;
+  const lines = data.toString("utf-8").split("\n");
+  // A partial window ends mid-line; that line and all after it cannot be checked.
+  if (partial) lines.pop();
+  const beyond = "content past the first 1 MiB cannot be checked";
+  if (offset >= lines.length) return partial ? `<${beyond} />` : "<end of file />";
+  const body = lines.slice(offset).join("\n") + (partial ? "\n" : "");
+  const end = partial ? `<truncated: ${beyond} />` : "";
+  if (Buffer.byteLength(body + end) <= limit) return body + end;
+  const more = "\n<truncated: use offset to read further />";
+  return cut(body, limit - Buffer.byteLength(more)) + more;
+}
+
+// At most `maxEntries` names, and the result, notice included, fits in `limit` bytes.
+function listing(data: Buffer, limit: number) {
+  const entries = data.toString("utf-8").split("\n").filter(Boolean);
+  if (!entries.length) return "(empty)";
+  const all = entries.join("\n");
+  if (entries.length <= maxEntries && Buffer.byteLength(all) <= limit) return all;
+  const notice = `<truncated: ${entries.length} entries />`;
+  const shown: string[] = [];
+  let size = Buffer.byteLength(notice);
+  for (const entry of entries.slice(0, maxEntries)) {
+    size += Buffer.byteLength(entry) + 1;
+    if (size > limit) break;
+    shown.push(entry);
   }
+  return [...shown, notice].join("\n");
 }

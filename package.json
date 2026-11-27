@@ -42,6 +42,7 @@
     "@carderne/sandbox-runtime": "^0.0.80"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "^1.5.2",
     "@earendil-works/pi-tui": "^1.5.2",
     "typebox": "*"
@@ -52,6 +53,7 @@
     }
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "^1.5.2",
     "@earendil-works/pi-coding-agent": "^1.5.2",
     "@earendil-works/pi-tui": "^1.5.2",
     "@types/node": "^24",

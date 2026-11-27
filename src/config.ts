@@ -4,6 +4,12 @@ import { dirname, join } from "node:path";
 import { type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
+import {
+  DEFAULT_HOST_REVIEW_CONFIG,
+  type HostReviewConfig,
+  resolveHostReviewConfig,
+} from "./host-review.ts";
+
 export type SandboxConfig = Omit<SandboxRuntimeConfig, "network" | "filesystem"> & {
   /**
    * `denyMandatoryCwdFiles` is added to @carderne/sandbox-runtime by PR #21.
@@ -21,7 +27,7 @@ export type SandboxConfig = Omit<SandboxRuntimeConfig, "network" | "filesystem">
   enableAccessRequestTool?: boolean;
   permissionPromptTimeoutSeconds?: number;
   /** Operator-approved host Bash tool. Global-only; project values are ignored. */
-  hostBash?: Partial<HostBashConfig>;
+  hostBash?: Partial<Omit<HostBashConfig, "review">> & { review?: Partial<HostReviewConfig> };
   network?: NonNullable<SandboxRuntimeConfig["network"]> & {
     allowUnauthenticatedSocksProxy?: boolean;
     /** Route ordinary `ssh` commands through the sandbox SOCKS proxy. */
@@ -66,6 +72,8 @@ export type HostBashConfig = {
    * that person's answer.
    */
   approvalModes: HostBashApprovalMode[];
+  /** Who approves a call: the operator only, or an LLM reviewer first. */
+  review: HostReviewConfig;
 };
 
 export const HOST_BASH_APPROVAL_MODES = ["tui", "rpc"] as const;
@@ -76,6 +84,7 @@ export const DEFAULT_HOST_BASH_CONFIG: HostBashConfig = {
   timeoutSeconds: 60,
   outputBytes: 16 * 1024,
   approvalModes: ["tui", "rpc"],
+  review: DEFAULT_HOST_REVIEW_CONFIG,
 };
 
 function boundedInteger(value: unknown, min: number, max: number, fallback: number) {
@@ -96,6 +105,7 @@ export function resolveHostBashConfig(value: unknown): HostBashConfig {
     approvalModes: Array.isArray(modes)
       ? HOST_BASH_APPROVAL_MODES.filter((mode) => modes.includes(mode))
       : [...defaults.approvalModes],
+    review: resolveHostReviewConfig(raw.review),
   };
 }
 

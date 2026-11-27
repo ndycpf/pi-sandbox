@@ -1,11 +1,12 @@
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
-import { createServer } from "node:net";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
+import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { mock, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { SandboxManager } from "@carderne/sandbox-runtime";
+import { createSandboxManager, SandboxManager } from "@carderne/sandbox-runtime";
 import assert from "node:assert/strict";
 
 import { DEFAULT_CONFIG, mergeConfigLayers } from "../src/config.ts";
@@ -13,7 +14,9 @@ import { canonicalizePath } from "../src/policy.ts";
 import {
   buildRuntimeConfig,
   clearSessionAllowances,
+  createReviewSandbox,
   createSandboxedBashOps,
+  initializeSandbox,
   resolveAllowances,
   supportsNodeEnvProxy,
   supportsSandboxPlatform,
@@ -460,3 +463,114 @@ test("clearSessionAllowances empties the grant lists in place", () => {
   assert.equal(allowances.readPaths, readPaths);
   assert.equal(allowances.writePaths, writePaths);
 });
+
+test("reviewer commands run in their own sandbox with no writes", async () => {
+  const calls: unknown[] = [];
+  const session = {
+    getConfig: () => ({
+      filesystem: { denyRead: ["/secret"], allowRead: [], allowWrite: ["/work"], denyWrite: [] },
+      network: { allowedDomains: ["example.com"], deniedDomains: [] },
+      credentials: { files: [{ path: "/work/token", mode: "deny" }] },
+    }),
+  } as unknown as typeof SandboxManager;
+  const offline = {
+    initialize: async (config: { network: unknown }) => calls.push(["init", config.network]),
+    wrapWithSandbox: async (command: string, shell: string, custom: unknown) => {
+      calls.push([shell, custom]);
+      return command;
+    },
+    cleanupAfterCommand: () => calls.push("cleanup"),
+    reset: async () => calls.push("reset"),
+  } as unknown as typeof SandboxManager;
+  const review = createReviewSandbox(session, () => offline);
+  const result = await review.exec(
+    { command: "printf $PATH; exit 3", cwd: tmpdir(), shell: "/bin/sh", denyRead: ["/x/.env"] },
+    undefined,
+  );
+  assert.equal(result.stdout.toString(), "/usr/bin:/bin");
+  assert.equal(result.exitCode, 3);
+  await review.reset();
+  assert.deepEqual(calls, [
+    [
+      "init",
+      {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowUnixSockets: [],
+        allowLocalBinding: false,
+        strictAllowlist: true,
+      },
+    ],
+    [
+      "/bin/sh",
+      {
+        filesystem: {
+          denyRead: ["/secret", "/x/.env"],
+          allowRead: [],
+          allowWrite: [],
+          denyWrite: [],
+          disabled: false,
+        },
+        credentials: { files: [{ path: "/work/token", mode: "deny" }] },
+      },
+    ],
+    "cleanup",
+    "reset",
+  ]);
+});
+
+test(
+  "the reviewer's proxy refuses hosts the session allows",
+  { skip: !supportsSandboxPlatform(), timeout: 15_000 },
+  async (t) => {
+    const session = createSandboxManager();
+    let offline: typeof SandboxManager | undefined;
+    const review = createReviewSandbox(session, () => (offline = createSandboxManager()));
+    const origin = createHttpServer((_req, res) => res.end("ok"));
+    t.after(async () => {
+      origin.close();
+      await review.reset();
+      await session.reset();
+    });
+    await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+    const port = (origin.address() as AddressInfo).port;
+    const config = {
+      ...DEFAULT_CONFIG,
+      network: { ...DEFAULT_CONFIG.network!, allowedDomains: ["127.0.0.1"] },
+    };
+    try {
+      await initializeSandbox(session, config);
+    } catch (error) {
+      t.skip(`sandbox unavailable: ${String(error)}`);
+      return;
+    }
+    // Starts the reviewer's sandbox; the command itself may fail where the OS
+    // sandbox cannot run, which this test does not depend on.
+    await review
+      .exec({ command: "true", cwd: tmpdir(), shell: "/bin/sh", denyRead: [] }, undefined)
+      .catch(() => {});
+    assert.ok(offline);
+    const through = (manager: typeof SandboxManager) =>
+      new Promise<number | undefined>((resolve, reject) => {
+        const token = manager.getProxyAuthToken();
+        const req = httpRequest(
+          {
+            host: "127.0.0.1",
+            port: manager.getProxyPort(),
+            path: `http://127.0.0.1:${port}/`,
+            headers: token
+              ? { "Proxy-Authorization": `Basic ${Buffer.from(`srt:${token}`).toString("base64")}` }
+              : {},
+          },
+          (res) => {
+            res.resume();
+            resolve(res.statusCode);
+          },
+        );
+        req.on("error", reject);
+        req.end();
+      });
+    assert.equal(await through(session), 200);
+    assert.equal(await through(offline), 403);
+  },
+);

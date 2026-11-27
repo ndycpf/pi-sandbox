@@ -17,6 +17,7 @@ import {
   resolveHostBashConfig,
 } from "../src/config.ts";
 import { hostPath, registerHostBash, titleRows } from "../src/host-bash.ts";
+import { DEFAULT_HOST_REVIEW_CONFIG } from "../src/host-review.ts";
 
 test("host_bash requires one current affirmative terminal approval", async (t) => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-approval-")));
@@ -108,7 +109,7 @@ test("host_bash requires one current affirmative terminal approval", async (t) =
   assert.deepEqual(choices, ["Deny", "Allow once"]);
   assert.match(title, /limit 60s, agent sees last 16384 bytes of output/);
   choose("Allow once");
-  assert.deepEqual((await pending).details, { exitCode: 0 });
+  assert.deepEqual((await pending).details, { exitCode: 0, approvedBy: "operator" });
   assert.equal(launch.mock.callCount(), 1);
 
   const abort = new AbortController();
@@ -204,7 +205,23 @@ test("hostBash config is global-only and validated", () => {
     timeoutSeconds: 60,
     outputBytes: 16384,
     approvalModes: ["tui", "rpc"],
+    review: {
+      mode: "human",
+      timeoutSeconds: 60,
+      log: { enabled: true, maxBytes: 1048576, files: 3 },
+      thinking: "low",
+      binaries: DEFAULT_HOST_REVIEW_CONFIG.binaries,
+    },
   });
+  // A project file cannot turn on auto-review either.
+  assert.equal(
+    mergeConfigLayers(
+      DEFAULT_CONFIG,
+      { hostBash: { enabled: true } },
+      { hostBash: { review: { mode: "auto", model: "x/y" } } },
+    ).hostBash?.review?.mode,
+    "human",
+  );
   assert.equal(
     mergeConfigLayers(DEFAULT_CONFIG, {}, { hostBash: { enabled: true } }).hostBash?.enabled,
     false,
@@ -272,7 +289,7 @@ test("host_bash asks an RPC client without a TTY when rpc approval is enabled", 
   host.start(context);
   t.after(() => host.stop());
   const run = () => tool.execute("t", { command: "true" }, undefined, undefined, context);
-  assert.deepEqual((await run()).details, { exitCode: 0 });
+  assert.deepEqual((await run()).details, { exitCode: 0, approvedBy: "operator" });
   for (answer of [undefined, "Deny", "allow once"]) await assert.rejects(run(), /refused/);
   assert.equal(prompts, 4);
   assert.equal(launch.mock.callCount(), 1);

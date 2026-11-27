@@ -57,7 +57,7 @@ test(
     const result = await run(
       'printf "%s|%s" "$PWD" "$PATH" > out; echo hello; echo oops >&2; exit 3',
     );
-    assert.deepEqual(result.details, { exitCode: 3 });
+    assert.deepEqual(result.details, { exitCode: 3, approvedBy: "operator" });
     assert.equal(readFileSync(join(cwd, "out"), "utf8"), cwd + "|" + process.env.PATH);
     assert.match(
       result.text,
@@ -131,7 +131,7 @@ test(
 test("exit 127 explains how to fix the host PATH", { skip: !supported }, async (t) => {
   const { run } = fixture(t);
   const result = await run("definitely-not-a-command-xyz");
-  assert.deepEqual(result.details, { exitCode: 127 });
+  assert.deepEqual(result.details, { exitCode: 127, approvedBy: "operator" });
   assert.ok(result.text.includes(`not found on the host PATH (${process.env.PATH})`));
   assert.match(result.text, /add its directory to PATH in the shell that starts Pi/);
 });

@@ -1,6 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join, posix } from "node:path";
+import { dirname, join } from "node:path";
 
 import { type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -57,8 +56,6 @@ export const DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS = 10 * 60;
 export type HostBashConfig = {
   /** Register `bash_with_human_approval`. */
   enabled: boolean;
-  /** Absolute directories appended after `/usr/bin:/bin` for host commands. */
-  extraPath: string[];
   /** Execution limit for one approved command. */
   timeoutSeconds: number;
   /** Bytes of combined stdout/stderr tail returned to the agent; 0 returns exit status only. */
@@ -67,7 +64,6 @@ export type HostBashConfig = {
 
 export const DEFAULT_HOST_BASH_CONFIG: HostBashConfig = {
   enabled: false,
-  extraPath: [],
   timeoutSeconds: 60,
   outputBytes: 16 * 1024,
 };
@@ -78,35 +74,12 @@ function boundedInteger(value: unknown, min: number, max: number, fallback: numb
     : fallback;
 }
 
-// A leading "~/", "$HOME/" or "${HOME}/" (or the bare variable) means the home directory.
-function expandHome(entry: string) {
-  const match = /^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/.exec(entry);
-  return match ? join(homedir(), entry.slice(match[0].length)) : entry;
-}
-
-// Absolute and already normalized: no ".", "..", empty or trailing components.
-// The OS resolves ".." after following symlinks, so such entries could be
-// checked at one place and searched at another.
-export function isPlainAbsolutePath(entry: string) {
-  return (
-    entry.startsWith("/") &&
-    !entry.includes(":") &&
-    !entry.includes("\0") &&
-    posix.normalize(entry) === entry &&
-    !entry.split("/").some((part) => part === "." || part === "..") &&
-    (entry === "/" || !entry.endsWith("/"))
-  );
-}
-
 /** Validate a global `hostBash` entry, dropping invalid values. */
 export function resolveHostBashConfig(value: unknown): HostBashConfig {
   const raw = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
   const defaults = DEFAULT_HOST_BASH_CONFIG;
   return {
     enabled: raw.enabled === true,
-    extraPath: [
-      ...new Set((stringArray(raw.extraPath) ?? []).map(expandHome).filter(isPlainAbsolutePath)),
-    ],
     timeoutSeconds: boundedInteger(raw.timeoutSeconds, 1, 3600, defaults.timeoutSeconds),
     outputBytes: boundedInteger(raw.outputBytes, 0, 64 * 1024, defaults.outputBytes),
   };

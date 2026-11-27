@@ -1,9 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import childProcess, { ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -16,7 +16,7 @@ import {
   mergeConfigLayers,
   resolveHostBashConfig,
 } from "../src/config.ts";
-import { hostPath, titleRows, registerUnsandboxBash, within } from "../src/unsandbox-bash.ts";
+import { hostPath, registerUnsandboxBash, titleRows } from "../src/unsandbox-bash.ts";
 
 test("bash_with_human_approval requires one current affirmative terminal approval", async (t) => {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-approval-")));
@@ -126,12 +126,17 @@ test("bash_with_human_approval requires one current affirmative terminal approva
   await assert.rejects(pending, /approval timed out/);
   timeout.mock.restore();
   // Oversized commands go back to the agent without prompting the operator.
-  // Here the header takes 4 of the 11 title rows an 80x24 terminal leaves.
+  // The header's height depends on the CWD length, so derive the budget from it.
   const before = prompts;
   const lines = (n: number) => Array.from({ length: n }, (_, i) => `echo ${i}`).join("\n");
+  const header = title.slice(0, title.indexOf("Command: "));
+  const available = 11 - titleRows(header.slice(0, -1));
+  assert.ok(available >= 4);
   await assert.rejects(
-    run(undefined, lines(8)),
-    /refused before prompting: command too long\. The approval prompt must fit an 80x24 terminal, which leaves 11 rows .* the command gets 7 rows of 78 columns; as shown \(JSON-quoted\) it has 8 lines and needs 8 rows/,
+    run(undefined, lines(available + 1)),
+    new RegExp(
+      `refused before prompting: command too long\\. The approval prompt must fit an 80x24 terminal, which leaves 11 rows .* the command gets ${available} rows of 78 columns; as shown \\(JSON-quoted\\) it has ${available + 1} lines and needs ${available + 1} rows`,
+    ),
   );
   // One long line wraps at the assumed width.
   await assert.rejects(
@@ -140,13 +145,12 @@ test("bash_with_human_approval requires one current affirmative terminal approva
   );
   assert.equal(prompts, before);
   // The largest command that fits is still prompted in full.
-  pending = run(undefined, lines(7));
+  pending = run(undefined, lines(available));
   assert.equal(prompts, before + 1);
   assert.equal(titleRows(title), 11);
-  assert.ok(title.includes(JSON.stringify("echo 6")));
+  assert.ok(title.includes(JSON.stringify(`echo ${available - 1}`)));
   choose("Deny");
   await assert.rejects(pending, /refused/);
-  assert.equal(prompts, before + 1);
   assert.equal(launch.mock.callCount(), 1);
 });
 
@@ -186,20 +190,10 @@ test("bash_with_human_approval refuses when hostBash is disabled", async (t) => 
 test("hostBash config is global-only and validated", () => {
   const merged = mergeConfigLayers(
     DEFAULT_CONFIG,
-    {
-      hostBash: {
-        enabled: true,
-        extraPath: ["/opt/homebrew/bin", "relative", "/a:/b", "/a/../b", "/a/./b", "/a//b", "/a/"],
-      },
-    },
-    { hostBash: { enabled: false, extraPath: ["/evil"], timeoutSeconds: 3000 } },
+    { hostBash: { enabled: true } },
+    { hostBash: { enabled: false, timeoutSeconds: 3000 } },
   );
-  assert.deepEqual(merged.hostBash, {
-    enabled: true,
-    extraPath: ["/opt/homebrew/bin"],
-    timeoutSeconds: 60,
-    outputBytes: 16384,
-  });
+  assert.deepEqual(merged.hostBash, { enabled: true, timeoutSeconds: 60, outputBytes: 16384 });
   assert.equal(
     mergeConfigLayers(DEFAULT_CONFIG, {}, { hostBash: { enabled: true } }).hostBash?.enabled,
     false,
@@ -209,76 +203,15 @@ test("hostBash config is global-only and validated", () => {
     DEFAULT_HOST_BASH_CONFIG,
   );
   assert.equal(resolveHostBashConfig({ timeoutSeconds: 600, outputBytes: 0 }).outputBytes, 0);
-  assert.deepEqual(
-    resolveHostBashConfig({
-      extraPath: [
-        "~/.docker/bin",
-        "$HOME/.orbstack/bin",
-        "${HOME}/bin",
-        "$HOME",
-        "~x",
-        "$HOMEX/bin",
-      ],
-    }).extraPath,
-    [
-      join(homedir(), ".docker/bin"),
-      join(homedir(), ".orbstack/bin"),
-      join(homedir(), "bin"),
-      homedir(),
-    ],
-  );
 });
 
-test("within treats names starting with .. as inside", () => {
-  assert.equal(within("/ws", "/ws/..tools/bin"), true);
-  assert.equal(within("/ws", "/ws"), true);
-  assert.equal(within("/ws", "/ws/../x"), false);
-  assert.equal(within("/ws", "/other"), false);
-});
-
-test("hostPath checks entries where the OS would resolve them", () => {
-  const base = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-path-")));
-  try {
-    const ws = join(base, "real", "ws");
-    mkdirSync(join(ws, "sub"), { recursive: true });
-    symlinkSync(join(base, "real"), join(base, "alias"));
-    symlinkSync(join(ws, "sub"), join(base, "link"));
-    mkdirSync(join(base, "tools", "bin"), { recursive: true });
-    symlinkSync(join(base, "tools"), join(base, "tools-link"));
-    assert.equal(
-      hostPath(
-        [
-          // Missing entry under a symlinked workspace path.
-          join(base, "alias", "ws", "missing-bin"),
-          join(base, "alias", "ws"),
-          join(ws, "..tools", "bin"),
-          // The OS follows "link" before "..", landing in the workspace.
-          base + "/link/../evil",
-          base + "/outside/./bin",
-          base + "/outside//bin",
-          base + "/outside/bin/",
-          join(base, "outside", "bin"),
-          // Kept entries are passed as the canonical path that was checked.
-          join(base, "tools-link", "bin"),
-        ],
-        ws,
-        [],
-      ),
-      ["/usr/bin:/bin", join(base, "outside", "bin"), join(base, "tools", "bin")].join(":"),
-    );
-  } finally {
-    rmSync(base, { recursive: true, force: true });
-  }
-});
-
-test("hostPath keeps system directories first and drops sandbox-writable entries", () => {
-  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-path-")));
-  try {
-    assert.equal(
-      hostPath(["/opt/homebrew/bin", join(cwd, "bin"), "/tmp/bin", join(tmpdir(), "x")], cwd),
-      "/usr/bin:/bin:/opt/homebrew/bin",
-    );
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
+test("hostPath inherits Pi's PATH", (t) => {
+  const previous = process.env.PATH;
+  t.after(() => {
+    process.env.PATH = previous;
+  });
+  process.env.PATH = "/opt/homebrew/bin:/usr/bin:/bin";
+  assert.equal(hostPath(), "/opt/homebrew/bin:/usr/bin:/bin");
+  process.env.PATH = "";
+  assert.equal(hostPath(), "/usr/bin:/bin");
 });

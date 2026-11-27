@@ -2,21 +2,21 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { spawn } from "node:child_process";
 import { closeSync, constants, fstatSync, openSync, realpathSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { DEFAULT_HOST_BASH_CONFIG, type HostBashConfig, isPlainAbsolutePath } from "./config.ts";
+import { DEFAULT_HOST_BASH_CONFIG, type HostBashConfig } from "./config.ts";
 
 const shell = "/bin/bash";
 const refusal = "Host command refused.";
 const deadline = 60_000; // Approval limit.
-const systemPath = "/usr/bin:/bin";
+const fallbackPath = "/usr/bin:/bin";
 const outputGraceMs = 200;
 // Prints "device:inode" of a path; device numbers match Node's fstat().dev.
-const statCommand = process.platform === "darwin" ? "stat -f %d:%i" : "stat -c %d:%i";
+// Absolute, so a program planted on the inherited PATH cannot fake the check.
+const statCommand =
+  process.platform === "darwin" ? "/usr/bin/stat -f %d:%i" : "/usr/bin/stat -c %d:%i";
 let busy = false; // One prompt or process across registrations sharing this module.
 
 // Reversible ASCII display, including newlines, bidi controls and invisible characters.
@@ -48,7 +48,6 @@ async function approve(
   ctx: ExtensionContext,
   command: string,
   cwd: string,
-  path: string,
   options: HostBashConfig,
   signal: AbortSignal,
 ) {
@@ -59,7 +58,6 @@ async function approve(
     "Run outside the OS sandbox? Host files and network are reachable.",
     `${shell}, limit ${options.timeoutSeconds}s, ${output}.`,
     "CWD: " + quoted(cwd),
-    "PATH: " + quoted(path),
   ];
   const shown = command.split("\n").map(quoted);
   const title = [...header, "Command: " + shown.join("\n")].join("\n");
@@ -71,7 +69,7 @@ async function approve(
     throw new ApprovalRefused(
       "Host command refused before prompting: command too long. " +
         `The approval prompt must fit an ${assumedColumns}x${assumedRows} terminal, which leaves ${maxTitleRows} rows for its text. ` +
-        `With this call's CWD and PATH, the command gets ${available} rows of ${assumedColumns - 2} columns; ` +
+        `With this call's CWD, the command gets ${available} rows of ${assumedColumns - 2} columns; ` +
         `as shown (JSON-quoted) it has ${shown.length} ${shown.length === 1 ? "line" : "lines"} and needs ${rows - (maxTitleRows - available)} rows. ` +
         "The operator could not read all of it. " +
         "Shorten the command (fewer and shorter lines) and call again: split it into several bash_with_human_approval calls, " +
@@ -90,49 +88,9 @@ async function approve(
   return choice === "Allow once";
 }
 
-export function within(parent: string, child: string) {
-  const rel = relative(parent, child);
-  return rel === "" || (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel));
-}
-
-// Canonical path, resolving symlinks through the nearest existing ancestor so
-// a missing entry is compared by where it would be created. Undefined if no
-// ancestor resolves.
-function resolved(path: string) {
-  let current = resolve(path);
-  const rest: string[] = [];
-  for (;;) {
-    try {
-      return join(realpathSync.native(current), ...rest);
-    } catch {
-      const parent = dirname(current);
-      if (parent === current) return undefined;
-      rest.unshift(basename(current));
-      current = parent;
-    }
-  }
-}
-
-// System directories first so configured entries cannot shadow them. Entries
-// in the workspace or temp directories are dropped because sandboxed Bash can
-// write there. Each kept entry is passed as the canonical path it was checked as.
-export function hostPath(
-  extraPath: readonly string[],
-  cwd: string,
-  writableRoots: readonly string[] = ["/tmp", tmpdir()],
-) {
-  const writable = [cwd, ...writableRoots]
-    .flatMap((dir) => [resolve(dir), resolved(dir)])
-    .filter((dir): dir is string => dir !== undefined);
-  const extra: string[] = [];
-  for (const entry of extraPath) {
-    if (!isPlainAbsolutePath(entry)) continue;
-    const real = resolved(entry);
-    if (real === undefined || real.includes(":")) continue;
-    if (writable.some((dir) => within(dir, entry) || within(dir, real))) continue;
-    if (!extra.includes(real)) extra.push(real);
-  }
-  return [systemPath, ...extra].join(":");
+// Host commands use Pi's own PATH, like a terminal the operator opened.
+export function hostPath() {
+  return process.env.PATH || fallbackPath;
 }
 
 // Keeps the last `limit` bytes written to it.
@@ -174,7 +132,7 @@ function format(code: number | null, tail: Tail | undefined, path: string) {
   if (code === 127) {
     status +=
       `\nExit status 127 usually means a program was not found on the host PATH (${path}). ` +
-      "Report this to the operator: if the program is installed elsewhere, they can add its directory to hostBash.extraPath in the global sandbox.json. " +
+      "Report this to the operator: if the program is installed elsewhere, they can add its directory to PATH in the shell that starts Pi and restart Pi. " +
       "Do not retry the same command.";
   }
   return status + outputText(tail);
@@ -199,7 +157,7 @@ export function registerUnsandboxBash(
       "Typical signs: 'Operation not permitted', 'Permission denied' outside the workspace, blocked network, 'command not found' for a tool installed on the host (docker, brew, gcloud), " +
       "an unreachable daemon or socket, or missing or invalid credentials (gh, git, cloud CLIs, keychain). " +
       "Every call prompts the operator, so do not use it for work the sandbox can do. " +
-      "Keep the command short and self-contained: the approval prompt must fit an 80x24 terminal, so a command over about 6 short lines is refused without prompting and must be shortened or split. " +
+      "Keep the command short and self-contained: the approval prompt must fit an 80x24 terminal, so a command over about 8 short lines is refused without prompting and must be shortened or split. " +
       "Runs non-interactively with stdin closed, a minimal PATH and environment, and a time limit. " +
       "Returns the exit status and, when enabled, the tail of combined stdout/stderr.",
     promptSnippet: "Ask the operator to run one Bash command outside the sandbox",
@@ -249,10 +207,10 @@ export function registerUnsandboxBash(
         const cwd = realpathSync.native(original);
         fd = openSync(cwd, constants.O_RDONLY | constants.O_DIRECTORY);
         const dir = fstatSync(fd, { bigint: true });
-        const path = hostPath(options.extraPath, cwd);
+        const path = hostPath();
         approval.throwIfAborted();
         if (
-          (await approve(ctx, command, cwd, path, options, approval)) !== true ||
+          (await approve(ctx, command, cwd, options, approval)) !== true ||
           !current() ||
           approval.aborted ||
           performance.now() >= expires ||

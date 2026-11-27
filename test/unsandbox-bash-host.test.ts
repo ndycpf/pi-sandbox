@@ -53,12 +53,12 @@ test(
     skip: !supported,
   },
   async (t) => {
-    const { cwd, run } = fixture(t, { extraPath: ["/opt/example/bin", join(tmpdir(), "bin")] });
+    const { cwd, run } = fixture(t);
     const result = await run(
       'printf "%s|%s" "$PWD" "$PATH" > out; echo hello; echo oops >&2; exit 3',
     );
     assert.deepEqual(result.details, { exitCode: 3 });
-    assert.equal(readFileSync(join(cwd, "out"), "utf8"), cwd + "|/usr/bin:/bin:/opt/example/bin");
+    assert.equal(readFileSync(join(cwd, "out"), "utf8"), cwd + "|" + process.env.PATH);
     assert.match(
       result.text,
       /^Host Bash exit status: 3\nOutput \(stdout and stderr interleaved\):\n/,
@@ -128,10 +128,10 @@ test(
   },
 );
 
-test("exit 127 explains how to extend the host PATH", { skip: !supported }, async (t) => {
+test("exit 127 explains how to fix the host PATH", { skip: !supported }, async (t) => {
   const { run } = fixture(t);
   const result = await run("definitely-not-a-command-xyz");
   assert.deepEqual(result.details, { exitCode: 127 });
-  assert.match(result.text, /not found on the host PATH \(\/usr\/bin:\/bin\)/);
-  assert.match(result.text, /hostBash\.extraPath/);
+  assert.ok(result.text.includes(`not found on the host PATH (${process.env.PATH})`));
+  assert.match(result.text, /add its directory to PATH in the shell that starts Pi/);
 });

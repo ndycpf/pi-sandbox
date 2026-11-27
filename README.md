@@ -187,9 +187,6 @@ restart Pi after enabling it.
 {
   "hostBash": {
     "enabled": true,
-    // Absolute, normalized paths (no "." or ".."), appended after /usr/bin:/bin.
-    // A leading "~/" or "$HOME/" is expanded. Entries in the workspace or temp directory are dropped.
-    "extraPath": ["/opt/homebrew/bin", "/usr/local/bin", "$HOME/.docker/bin"],
     // Execution limit for one command (1-3600, default 60).
     "timeoutSeconds": 300,
     // Tail of combined stdout/stderr returned to the agent (0-65536, default 16384).
@@ -201,24 +198,36 @@ restart Pi after enabling it.
 
 While the sandbox is active, ordinary `bash` still runs inside it. The
 interactive Linux/macOS CLI shows the time limit, how much output the agent
-will see, the shell, PATH, resolved working directory and JSON-quoted command
+will see, the shell, resolved working directory and JSON-quoted command
 lines in Pi's standard selector. **Deny** is selected first. **Allow once** runs
 the command once. The prompt is sized for an 80x24 terminal: its text, wrapped
-at 80 columns, may take 11 rows, which leaves about 7 short command lines after
-the CWD and PATH lines. A longer command never reaches you: the agent gets a
+at 80 columns, may take 11 rows, which leaves about 8 short command lines after
+the header. A longer command never reaches you: the agent gets a
 "command too long" error with the budget and is asked to shorten or split it, so
 you do not approve text you could not see in such a terminal. A window smaller
 than 80x24, or many extension widgets below the prompt, can still push the top
 of the prompt off screen; keep the terminal at least that size. Escape cancels. RPC, print, JSON and non-TTY sessions cannot approve.
 
-The command runs in a fresh `/bin/bash` with stdin closed, the PATH above and
-the operator's HOME. It has the host user's filesystem and network access.
-The returned output can include anything the command prints, so it reaches the
-model. Approval has a 60-second limit. Changes or detached processes can outlive
-the command. Use a terminal you control with trusted Pi extensions. This action
-stores no approval and does not retry a previous call or change the session's
-sandbox settings. Keep directories in `extraPath` out of the agent's sandbox
-write access, or a sandboxed command could plant a program there.
+The command runs in a fresh `/bin/bash --noprofile --norc` with stdin closed,
+the `PATH` Pi was started with and the operator's HOME, like a command typed in
+your own terminal. It has the host user's filesystem and network access, and
+nothing it starts is sandboxed. The returned output can include anything the
+command prints, so it reaches the model. Approval has a 60-second limit. Changes
+or detached processes can outlive the command. This action stores no approval
+and does not retry a previous call or change the session's sandbox settings.
+
+**What approval covers.** You approve the command text and working directory
+only, not the files and programs it uses. The agent can write to the workspace
+and other sandbox-writable locations before asking, so review what the command
+will pick up from there, for example:
+
+- programs found through a `PATH` entry the sandbox can write to, such as
+  `./node_modules/.bin` or a directory inside the workspace;
+- `.git/hooks`, `.git/config` and other repository configuration used by `git`;
+- package manager scripts (`package.json`, `Makefile`, `pyproject.toml`, ...);
+- scripts or configuration files the command runs or reads from the workspace.
+
+Use a terminal you control with trusted Pi extensions.
 
 ### What is prompted vs. hard-blocked
 

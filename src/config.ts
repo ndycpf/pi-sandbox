@@ -28,6 +28,8 @@ export type SandboxConfig = Omit<SandboxRuntimeConfig, "network" | "filesystem">
   permissionPromptTimeoutSeconds?: number;
   /** Operator-approved host Bash tool. Global-only; project values are ignored. */
   hostBash?: Partial<Omit<HostBashConfig, "review">> & { review?: Partial<HostReviewConfig> };
+  /** Sandboxed long-running commands (`bash_background`). */
+  backgroundBash?: Partial<BackgroundBashConfig>;
   network?: NonNullable<SandboxRuntimeConfig["network"]> & {
     allowUnauthenticatedSocksProxy?: boolean;
     /** Route ordinary `ssh` commands through the sandbox SOCKS proxy. */
@@ -72,8 +74,32 @@ export type HostBashConfig = {
    * that person's answer.
    */
   approvalModes: HostBashApprovalMode[];
+  /**
+   * Let `host_bash` start a command in the background (`background: true`).
+   * The command is approved like any other call, then runs outside the sandbox
+   * without the time limit until it exits, is stopped, or the session ends.
+   */
+  allowBackground: boolean;
   /** Who approves a call: the operator only, or an LLM reviewer first. */
   review: HostReviewConfig;
+};
+
+export type BackgroundBashConfig = {
+  /** Register `bash_background` and allow sandboxed background tasks. */
+  enabled: boolean;
+  /** Background tasks (sandboxed and host) that may run at once. */
+  maxTasks: number;
+  /** Bytes of combined output kept in memory per task. */
+  bufferBytes: number;
+  /** Bytes of a sandboxed task's output tail the agent sees by default. */
+  outputBytes: number;
+};
+
+export const DEFAULT_BACKGROUND_BASH_CONFIG: BackgroundBashConfig = {
+  enabled: false,
+  maxTasks: 4,
+  bufferBytes: 1024 * 1024,
+  outputBytes: 16 * 1024,
 };
 
 export const HOST_BASH_APPROVAL_MODES = ["tui", "rpc"] as const;
@@ -84,6 +110,7 @@ export const DEFAULT_HOST_BASH_CONFIG: HostBashConfig = {
   timeoutSeconds: 60,
   outputBytes: 16 * 1024,
   approvalModes: ["tui", "rpc"],
+  allowBackground: false,
   review: DEFAULT_HOST_REVIEW_CONFIG,
 };
 
@@ -105,7 +132,20 @@ export function resolveHostBashConfig(value: unknown): HostBashConfig {
     approvalModes: Array.isArray(modes)
       ? HOST_BASH_APPROVAL_MODES.filter((mode) => modes.includes(mode))
       : [...defaults.approvalModes],
+    allowBackground: raw.allowBackground === true,
     review: resolveHostReviewConfig(raw.review),
+  };
+}
+
+/** Validate a `backgroundBash` entry, dropping invalid values. */
+export function resolveBackgroundBashConfig(value: unknown): BackgroundBashConfig {
+  const raw = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+  const defaults = DEFAULT_BACKGROUND_BASH_CONFIG;
+  return {
+    enabled: raw.enabled === true,
+    maxTasks: boundedInteger(raw.maxTasks, 1, 32, defaults.maxTasks),
+    bufferBytes: boundedInteger(raw.bufferBytes, 4096, 64 * 1024 * 1024, defaults.bufferBytes),
+    outputBytes: boundedInteger(raw.outputBytes, 0, 1024 * 1024, defaults.outputBytes),
   };
 }
 
@@ -181,6 +221,11 @@ export function mergeConfigLayers(
     allowProcessSignals: globalConfig.allowProcessSignals === true,
     // Host execution bypasses the sandbox; a project file must not enable or widen it.
     hostBash: resolveHostBashConfig(globalConfig.hostBash),
+    // Sandboxed, so a project may turn it on; the merged entry is validated.
+    backgroundBash: resolveBackgroundBashConfig({
+      ...(typeof globalConfig.backgroundBash === "object" ? globalConfig.backgroundBash : {}),
+      ...(typeof projectConfig.backgroundBash === "object" ? projectConfig.backgroundBash : {}),
+    }),
     network: {
       ...merged.network,
       allowedDomains:

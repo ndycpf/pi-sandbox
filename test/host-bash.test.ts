@@ -205,6 +205,7 @@ test("hostBash config is global-only and validated", () => {
     timeoutSeconds: 60,
     outputBytes: 16384,
     approvalModes: ["tui", "rpc"],
+    allowBackground: false,
     review: {
       mode: "human",
       timeoutSeconds: 60,

@@ -1,19 +1,27 @@
+import { spawn } from "node:child_process";
+
 import { createSandboxManager } from "@carderne/sandbox-runtime";
-import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
+  getShellConfig,
   isToolCallEventType,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
+import type { SpawnedTask } from "./background-session.ts";
+
+import { createBackgroundSession } from "./background-session.ts";
+import { BACKGROUND_TOOL } from "./background-tool.ts";
 import {
   addDomainToConfig,
   addReadPathToConfig,
   addWritePathToConfig,
   getConfigPaths,
   loadConfig,
+  resolveBackgroundBashConfig,
   resolveHostBashConfig,
 } from "./config.ts";
 import { registerHostBash } from "./host-bash.ts";
@@ -28,6 +36,7 @@ import {
   createReviewSandbox,
   createSandboxedBashOps,
   initializeSandbox,
+  spawnSandboxed,
   updateSandboxConfig,
   resolveAllowances,
   type SessionAllowances,
@@ -35,6 +44,7 @@ import {
   supportsSandboxPlatform,
   clearSessionAllowances,
 } from "./sandbox-runtime.ts";
+import { SettleGate } from "./settle-gate.ts";
 import {
   cancelPermissionPrompts,
   resetPermissionPrompts,
@@ -69,6 +79,36 @@ export default function (pi: ExtensionAPI) {
   let hostBash: ReturnType<typeof registerHostBash> | undefined;
   let projectTrusted = false;
   const allowances: SessionAllowances = { domains: [], readPaths: [], writePaths: [] };
+  const backgroundConfig = (cwd: string) =>
+    resolveBackgroundBashConfig(loadConfig(cwd, projectTrusted).backgroundBash);
+  // Long-running tasks belong to this session and this sandbox: they are
+  // stopped on shutdown and whenever the sandbox is turned on or off.
+  // Foreground bash waits for a sandbox change to finish before it decides
+  // whether to wrap its command, so it never runs unsandboxed while the
+  // sandbox is being turned on.
+  const sandboxChange = new SettleGate();
+  // Turning the sandbox on reports a failed initialization to the commands
+  // that waited for it, so they are refused instead of running on the host.
+  let lastInitError = "unknown error";
+  const changeSandbox = async (
+    kind: "enable" | "disable",
+    change: () => Promise<boolean>,
+  ): Promise<boolean> => {
+    const leave = sandboxChange.enter();
+    let ok = false;
+    try {
+      ok = await background.whileStopped(change);
+      return ok;
+    } finally {
+      leave(
+        kind === "enable" && !ok ? `the sandbox failed to start (${lastInitError})` : undefined,
+      );
+    }
+  };
+  const background = createBackgroundSession(pi, {
+    config: backgroundConfig,
+    spawn: spawnBackground,
+  });
 
   const effectiveAllowances = (cwd: string) =>
     resolveAllowances(loadConfig(cwd, projectTrusted), allowances);
@@ -137,26 +177,31 @@ export default function (pi: ExtensionAPI) {
     }
 
     hostBash?.start(ctx);
-    try {
-      await initializeSandbox(sandboxManager, config, allowances, ctx.cwd);
-      if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
-        process.env.NODE_USE_ENV_PROXY ??= "1";
+    // Tasks started while the sandbox was off must not keep running
+    // unsandboxed, and none may start until it is on.
+    return changeSandbox("enable", async () => {
+      try {
+        await initializeSandbox(sandboxManager, config, allowances, ctx.cwd);
+        if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
+          process.env.NODE_USE_ENV_PROXY ??= "1";
+        }
+        resetPermissionPrompts(pi);
+        sandboxEnabled = true;
+        sandboxInitialized = true;
+        warnIfAllDomainsAllowed(ctx, config);
+        warnIfLinuxUnenforcedGlobs(ctx, config);
+        updateStatus(ctx, config);
+        return true;
+      } catch (error) {
+        sandboxEnabled = false;
+        lastInitError = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(
+          `Sandbox initialization failed: ${error instanceof Error ? error.message : error}`,
+          "error",
+        );
+        return false;
       }
-      resetPermissionPrompts(pi);
-      sandboxEnabled = true;
-      sandboxInitialized = true;
-      warnIfAllDomainsAllowed(ctx, config);
-      warnIfLinuxUnenforcedGlobs(ctx, config);
-      updateStatus(ctx, config);
-      return true;
-    } catch (error) {
-      sandboxEnabled = false;
-      ctx.ui.notify(
-        `Sandbox initialization failed: ${error instanceof Error ? error.message : error}`,
-        "error",
-      );
-      return false;
-    }
+    });
   }
 
   async function disableSandbox(
@@ -169,19 +214,22 @@ export default function (pi: ExtensionAPI) {
 
     hostBash?.stop();
     cancelPermissionPrompts(pi);
-    if (sandboxInitialized) {
-      try {
-        await reviewSandbox.reset();
-        await sandboxManager.reset();
-      } catch {
-        // Ignore cleanup errors.
+    // No task may start while the sandbox is torn down.
+    return changeSandbox("disable", async () => {
+      if (sandboxInitialized) {
+        try {
+          await reviewSandbox.reset();
+          await sandboxManager.reset();
+        } catch {
+          // Ignore cleanup errors.
+        }
       }
-    }
-    sandboxEnabled = false;
-    sandboxInitialized = false;
-    clearSessionAllowances(allowances);
-    ctx.ui.setStatus("sandbox", "");
-    return true;
+      sandboxEnabled = false;
+      sandboxInitialized = false;
+      clearSessionAllowances(allowances);
+      ctx.ui.setStatus("sandbox", "");
+      return true;
+    });
   }
 
   async function toggleSandbox(ctx: Parameters<typeof warnIfAllDomainsAllowed>[0]): Promise<void> {
@@ -332,10 +380,40 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  async function spawnBackground(command: string, ctx: ExtensionContext): Promise<SpawnedTask> {
+    const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted });
+    const prefix = settings.getShellCommandPrefix();
+    const full = prefix ? `${prefix}\n${command}` : command;
+    if (sandboxEnabled && sandboxInitialized) {
+      const child = await spawnSandboxed(sandboxManager, full, ctx.cwd, {
+        shellPath: settings.getShellPath(),
+        sshProxy: loadConfig(ctx.cwd, projectTrusted).network?.sshProxy !== false,
+        env: process.env,
+      });
+      // Linux deny rules rely on mount points the runtime keeps until this runs.
+      return { kind: "sandbox", child, cleanup: () => sandboxManager.cleanupAfterCommand() };
+    }
+    // With the sandbox off, ordinary bash is unsandboxed too.
+    const { shell, args } = getShellConfig(settings.getShellPath());
+    const child = spawn(shell, [...args, full], {
+      cwd: ctx.cwd,
+      env: process.env,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { kind: "unsandboxed", child };
+  }
+
   pi.registerTool({
     ...localBash,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
+      const failure = await sandboxChange.settled();
+      if (failure) {
+        throw new Error(
+          `Command not run: ${failure} while it waited to start. Nothing was executed.`,
+        );
+      }
       const runBash = () => {
         const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted });
         const userShellPath = settings.getShellPath();
@@ -373,6 +451,17 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("user_bash", async (event, ctx) => {
+    const failure = await sandboxChange.settled();
+    if (failure) {
+      return {
+        result: {
+          output: `Command not run: ${failure} while it waited to start.`,
+          exitCode: 1,
+          cancelled: false,
+          truncated: false,
+        },
+      };
+    }
     if (!sandboxEnabled || !sandboxInitialized) return;
 
     const userShellPath = SettingsManager.create(ctx.cwd, undefined, {
@@ -418,8 +507,15 @@ export default function (pi: ExtensionAPI) {
     if (!config.enabled) return;
     const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
 
-    if (sandboxInitialized && !config.network?.disabled && isToolCallEventType("bash", event)) {
-      for (const domain of extractDomainsFromCommand(event.input.command)) {
+    const bashCommand = isToolCallEventType("bash", event)
+      ? event.input.command
+      : event.toolName === BACKGROUND_TOOL &&
+          (event.input as { action?: string }).action === "start" &&
+          typeof (event.input as { command?: unknown }).command === "string"
+        ? (event.input as { command: string }).command
+        : undefined;
+    if (sandboxInitialized && !config.network?.disabled && bashCommand !== undefined) {
+      for (const domain of extractDomainsFromCommand(bashCommand)) {
         if (!domainIsAllowed(domain, effectiveDomains(ctx.cwd))) {
           const choice = await promptDomainBlock(
             pi,
@@ -480,8 +576,21 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
+    // No task may start until the new session's sandbox is set up.
+    const release = background.tasks.hold();
+    const leave = sandboxChange.enter();
+    try {
+      await startSession(event, ctx);
+    } finally {
+      leave();
+      release();
+    }
+  });
+
+  async function startSession(_event: unknown, ctx: ExtensionContext) {
     hostBash?.stop();
+    await background.tasks.stopAll();
     projectTrusted = ctx.isProjectTrusted();
     if (loadConfig(ctx.cwd, projectTrusted).enableAccessRequestTool === true) {
       registerAccessTools();
@@ -493,9 +602,18 @@ export default function (pi: ExtensionAPI) {
         // hostBash is global-only, so project trust does not change it.
         (cwd) => resolveHostBashConfig(loadConfig(cwd, false).hostBash),
         // The auto-reviewer reads through the sandbox, read-only and offline.
-        { reviewExec: reviewSandbox.exec },
+        {
+          reviewExec: reviewSandbox.exec,
+          background: { tasks: background.tasks, limits: backgroundConfig },
+        },
       );
     }
+    const startupConfig = loadConfig(ctx.cwd, projectTrusted);
+    background.attach(ctx, {
+      enabled: startupConfig.backgroundBash?.enabled === true,
+      hostBackground:
+        startupConfig.hostBash?.enabled === true && startupConfig.hostBash.allowBackground === true,
+    });
     if (pi.getFlag("no-sandbox") as boolean) {
       sandboxEnabled = false;
       ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
@@ -508,11 +626,12 @@ export default function (pi: ExtensionAPI) {
     }
     if (sandboxEnabled) hostBash?.start(ctx);
     await enableSandbox(ctx, true);
-  });
+  }
 
   pi.on("session_shutdown", async () => {
     hostBash?.stop();
     cancelPermissionPrompts(pi);
+    await background.detach();
     if (!sandboxInitialized) return;
     try {
       await reviewSandbox.reset();

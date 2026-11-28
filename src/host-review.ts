@@ -141,7 +141,10 @@ export type PlannedAction = {
   justification?: string;
   tty: false;
   env: { PATH: string; HOME?: string };
-  timeout_seconds: number;
+  /** Absent for a background run, which has no time limit. */
+  timeout_seconds?: number;
+  /** A background run keeps going after the call returns, until stopped or the session ends. */
+  run_in_background?: true;
   output_to_agent: string;
 };
 

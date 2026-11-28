@@ -198,7 +198,10 @@ restart Pi after enabling it.
     "outputBytes": 16384,
     // Pi modes that may answer the prompt (default ["tui", "rpc"]).
     // Remove "rpc" to refuse host_bash in RPC clients.
-    "approvalModes": ["tui", "rpc"]
+    "approvalModes": ["tui", "rpc"],
+    // Let host_bash start long-running commands with background: true
+    // (default false). See "Host background tasks" below.
+    "allowBackground": false
   }
 }
 ```
@@ -381,6 +384,98 @@ provider you configured. Use auto-review for convenience
 on a machine and model you trust, not as a security boundary; keep `mode:
 "human"` where a wrong `allow` would be costly.
 
+### Background tasks
+
+Ordinary `bash` waits for its command. On Linux, anything the command leaves
+running with `&`, `nohup` or `setsid` is killed as soon as the command returns,
+because bubblewrap ends the sandbox's PID namespace with it. On macOS such
+processes survive and stay sandboxed, but Pi no longer tracks them. For dev
+servers, watchers and long builds, enable `bash_background` instead:
+
+```jsonc
+{
+  "backgroundBash": {
+    "enabled": true,
+    // Background tasks (sandboxed and host) running at once (1-32, default 4).
+    "maxTasks": 4,
+    // Combined output kept in memory per task (4 KiB-64 MiB, default 1 MiB).
+    "bufferBytes": 1048576,
+    // Tail of a task's output the agent sees by default (0-1 MiB, default 16 KiB).
+    "outputBytes": 16384
+  }
+}
+```
+
+It can be set in the global or the project config, since the tasks run in the
+same sandbox as `bash`. The tool is registered at session start, so restart Pi
+after enabling it. The agent calls it with an `action`:
+
+- `start` runs `command` in the sandbox and returns a task id at once. Domains
+  in the command are checked and prompted for like a `bash` command.
+- `list` shows the tasks, `logs` the tail of a task's combined stdout/stderr,
+  and `stop` sends SIGTERM to the task's process group, then SIGKILL after 2
+  seconds.
+- `wait` watches a task until it exits, its new output matches `until` (a
+  regular expression), or `timeoutSeconds` pass (default 60, at most 600). The
+  task keeps running. `start` takes the same `until` and `timeoutSeconds`, for
+  example to return once a dev server prints its ready line. While it waits,
+  the call streams the task's output as tool progress, so the TUI and RPC
+  clients that show tool calls (such as Orca's chat) show it live. This holds
+  the agent's turn, so it suits waiting for readiness or a build, not watching
+  a server for its whole life.
+
+While tasks run, the footer shows their count, such as `bg: 2 running (1 host)`,
+and a widget below the editor lists up to five of them, one line each
+(`bg1 [sandbox] npm run dev`, with `HOST` for host tasks). Both are cleared when
+no task runs. They are plain text, so RPC clients get them too, as `setStatus`
+and `setWidget` (string lines) UI requests; whether they are shown is up to the
+client. `/background` lists the tasks; `/background stop` asks which one to stop
+(Pi's selector in the TUI, a select dialog in RPC clients), and
+`/background stop <id|all>` stops without asking.
+
+**RPC clients and Orca.** Orca's native chat (and any RPC client that does the
+same) drops `notify`, `setStatus` and `setWidget` and shows only dialogs, tool
+calls and assistant text. So in RPC mode `/background` lists the tasks in a
+select dialog instead of a notification: pick a running task, confirm, and it
+is stopped. The agent's `bash_background` calls appear as tool rows there too.
+While any task runs, pi-sandbox also reports the session as busy through Pi's
+shared session-liveness registry (`@agegr/pi-web/session-liveness/v1`), which
+Orca and pi-web ask before stopping an idle Pi; without it, Orca's idle stop
+(30 minutes by default) would end the session and its tasks.
+
+When a task exits on its own, its status and output tail are added to the
+conversation. A task is over when every process in its process group is: a
+command such as `server & echo started` stays running (and stoppable) after
+its shell exits, until the server does too. On Linux, zombies left in the
+group (where PID 1 does not reap orphans) do not keep a task running. Every task is stopped when the session ends (including `/new`
+and Pi exiting) and whenever the sandbox is turned on or off, so a task never
+outlives the sandbox it started in. Filesystem rules are fixed when a task
+starts; domains granted later apply to it, since the network proxy is shared.
+While the sandbox is off, `start` runs the command without a sandbox, like
+`bash`, and `list` marks it as such. A process that leaves the task's process
+group (for example with `setsid` on macOS) is not stopped by `stop`.
+
+#### Host background tasks
+
+With `hostBash.allowBackground: true` in the **global** config, `host_bash`
+also takes `background: true`. The command is approved exactly like any other
+`host_bash` call (by you, or by auto-review when that is on), and the prompt
+says it will run in the background until stopped or Pi exits. It works in the
+same Pi modes as `host_bash` itself (`hostBash.approvalModes`: the TUI on a
+terminal, and RPC clients when `"rpc"` is listed). Once approved it runs
+outside the sandbox until it exits, is stopped with `bash_background stop`, or
+the session ends; `hostBash.timeoutSeconds` does not apply. The agent sees at
+most `hostBash.outputBytes` of its output. `backgroundBash.maxTasks` counts
+host tasks too, and the `bash_background` tool is registered for them even
+when `backgroundBash.enabled` is false (then it can list, read and stop tasks,
+but not start sandboxed ones).
+
+```jsonc
+{
+  "hostBash": { "enabled": true, "allowBackground": true }
+}
+```
+
 ### What is prompted vs. hard-blocked
 
 | Rule | Behaviour |
@@ -450,6 +545,13 @@ this setting alone does not make the SSH agent usable.
 If neither file configures an array, its built-in defaults apply (see above for
 the defaults). Once an array is configured, only its combined global and local
 entries are used, so an explicit empty array disables that default.
+
+While the sandbox is being turned on or off (at session start, with Alt+S or
+`/sandbox-enable`/`/sandbox-disable`), a `bash` call or `!` command waits for
+the change to finish and then runs with the state it set, so a command started
+during initialization never runs unsandboxed. If turning the sandbox on fails,
+the commands that waited for it are refused with the error and nothing runs.
+Background starts are refused during the change instead.
 
 The footer shows a lock indicator while the sandbox is active.
 

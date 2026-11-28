@@ -62,6 +62,22 @@ function alive(pid: number) {
   }
 }
 
+/**
+ * Whether `pid` has ended: gone, or (on Linux) a zombie with no thread left.
+ * Where PID 1 does not reap orphans, a stopped orphan stays a zombie.
+ */
+function ended(pid: number) {
+  if (!alive(pid)) return true;
+  if (process.platform !== "linux") return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return (fields[0] === "Z" || fields[0] === "X") && Number(fields[17]) <= 1;
+  } catch {
+    return !alive(pid);
+  }
+}
+
 test("output tail keeps the last bytes", () => {
   const tail = new OutputTail(8);
   tail.push(Buffer.from("hello "));
@@ -154,7 +170,7 @@ test(
     assert.ok(alive(childPid));
     const stopped = await tasks.stop(info.id, 200);
     assert.equal(stopped?.state, "exited");
-    await until(() => !alive(childPid));
+    await until(() => ended(childPid));
     assert.equal(exits.length, 0);
   },
 );
@@ -183,7 +199,7 @@ test(
     assert.ok(alive(workerPid));
     const stopped = await tasks.stop(info.id, 200);
     assert.equal(stopped?.state, "exited");
-    await until(() => !alive(workerPid));
+    await until(() => ended(workerPid));
     assert.equal(exits.length, 0);
 
     // Once the rest of the group exits by itself, the task exits and is reported.
@@ -614,9 +630,11 @@ test(
     // Several watch periods: two matching scans would have ended it before.
     await new Promise((resolve) => setTimeout(resolve, 1000));
     assert.equal(tasks.get(info.id)?.state, "running");
+    // Its main thread is a zombie, but it has not ended.
+    assert.equal(ended(worker), false);
     const stopped = await tasks.stop(info.id, 200);
     assert.equal(stopped?.state, "exited");
-    await until(() => !alive(worker));
+    await until(() => ended(worker));
     assert.equal(exits.length, 0);
   },
 );
@@ -661,6 +679,8 @@ test(
     process.kill(info.pid!, "SIGKILL");
     await until(() => tasks.get(info.id)?.state === "exited", 5000);
     assert.ok(alive(zombie), "the zombie is still there");
+    // An unreaped zombie counts as ended, as a stopped orphan would.
+    assert.equal(ended(zombie), true);
     assert.equal(exits.length, 1);
   },
 );
@@ -834,7 +854,7 @@ test(
     assert.equal(tasks.running(), 1);
     const stopped = await stopping;
     assert.equal(stopped?.state, "exited");
-    await until(() => !alive(worker));
+    await until(() => ended(worker));
   },
 );
 

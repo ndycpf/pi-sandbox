@@ -543,6 +543,12 @@ If neither file configures an array, its built-in defaults apply (see above for
 the defaults). Once an array is configured, only its combined global and local
 entries are used, so an explicit empty array disables that default.
 
+While the sandbox is being turned on or off (at session start, with Alt+S or
+`/sandbox-enable`/`/sandbox-disable`), a `bash` call or `!` command waits for
+the change to finish and then runs with the state it set, so a command started
+during initialization never runs unsandboxed. Background starts are refused
+during the change instead.
+
 The footer shows a lock indicator while the sandbox is active.
 
 ## Ackowledgements

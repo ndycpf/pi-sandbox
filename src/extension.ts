@@ -44,6 +44,7 @@ import {
   supportsSandboxPlatform,
   clearSessionAllowances,
 } from "./sandbox-runtime.ts";
+import { SettleGate } from "./settle-gate.ts";
 import {
   cancelPermissionPrompts,
   resetPermissionPrompts,
@@ -82,6 +83,14 @@ export default function (pi: ExtensionAPI) {
     resolveBackgroundBashConfig(loadConfig(cwd, projectTrusted).backgroundBash);
   // Long-running tasks belong to this session and this sandbox: they are
   // stopped on shutdown and whenever the sandbox is turned on or off.
+  // Foreground bash waits for a sandbox change to finish before it decides
+  // whether to wrap its command, so it never runs unsandboxed while the
+  // sandbox is being turned on.
+  const sandboxChange = new SettleGate();
+  const changeSandbox = <T>(change: () => Promise<T>): Promise<T> => {
+    const leave = sandboxChange.enter();
+    return background.whileStopped(change).finally(leave);
+  };
   const background = createBackgroundSession(pi, {
     config: backgroundConfig,
     spawn: spawnBackground,
@@ -156,7 +165,7 @@ export default function (pi: ExtensionAPI) {
     hostBash?.start(ctx);
     // Tasks started while the sandbox was off must not keep running
     // unsandboxed, and none may start until it is on.
-    return background.whileStopped(async () => {
+    return changeSandbox(async () => {
       try {
         await initializeSandbox(sandboxManager, config, allowances, ctx.cwd);
         if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
@@ -191,7 +200,7 @@ export default function (pi: ExtensionAPI) {
     hostBash?.stop();
     cancelPermissionPrompts(pi);
     // No task may start while the sandbox is torn down.
-    return background.whileStopped(async () => {
+    return changeSandbox(async () => {
       if (sandboxInitialized) {
         try {
           await reviewSandbox.reset();
@@ -384,6 +393,7 @@ export default function (pi: ExtensionAPI) {
     ...localBash,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
+      await sandboxChange.settled();
       const runBash = () => {
         const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted });
         const userShellPath = settings.getShellPath();
@@ -421,6 +431,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("user_bash", async (event, ctx) => {
+    await sandboxChange.settled();
     if (!sandboxEnabled || !sandboxInitialized) return;
 
     const userShellPath = SettingsManager.create(ctx.cwd, undefined, {
@@ -538,9 +549,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (event, ctx) => {
     // No task may start until the new session's sandbox is set up.
     const release = background.tasks.hold();
+    const leave = sandboxChange.enter();
     try {
       await startSession(event, ctx);
     } finally {
+      leave();
       release();
     }
   });

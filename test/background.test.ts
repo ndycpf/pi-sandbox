@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-codi
 
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -496,12 +496,11 @@ test("tasks.add takes a child that already exited", { skip: !unix }, async () =>
 function fakeProc(t: TestContext) {
   const dir = mkdtempSync(join(tmpdir(), "pi-proc-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const add = (pid: number, comm: string, state: string, pgrp: number) => {
+  // Fields 3 to 21 of a stat line: state, ppid, pgrp, ..., num_threads (20), ...
+  const add = (pid: number, comm: string, state: string, pgrp: number, threads = 1) => {
     mkdirSync(join(dir, String(pid)), { recursive: true });
-    writeFileSync(
-      join(dir, String(pid), "stat"),
-      `${pid} (${comm}) ${state} 1 ${pgrp} ${pgrp} 0 -1\n`,
-    );
+    const rest = [state, 1, pgrp, pgrp, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, threads, 0];
+    writeFileSync(join(dir, String(pid), "stat"), `${pid} (${comm}) ${rest.join(" ")}\n`);
   };
   const remove = (pid: number) => rmSync(join(dir, String(pid)), { recursive: true, force: true });
   return { dir, add, remove };
@@ -513,8 +512,11 @@ test("a /proc scan sorts processes into groups, zombies apart", async (t) => {
   proc.add(101, "odd ) name", "Z", 100);
   proc.add(200, "other", "S", 200);
   proc.add(300, "x) S 1 300 (y", "R", 300);
+  // A dead main thread whose other threads still run.
+  proc.add(500, "threaded", "Z", 500, 3);
   mkdirSync(join(proc.dir, "self"));
   const groups = await new ProcessCensus(proc.dir, 0).scan();
+  assert.deepEqual(classifyGroup(groups, 500), { kind: "live" });
   assert.deepEqual(classifyGroup(groups, 100), { kind: "zombies", key: "100,101" });
   assert.deepEqual(classifyGroup(groups, 200), { kind: "live" });
   assert.deepEqual(classifyGroup(groups, 300), { kind: "live" });
@@ -568,6 +570,54 @@ test(
     await new Promise((resolve) => leader.once("exit", resolve));
     await until(() => !groupExists(pgid));
     assert.equal(await new GroupWatch(pgid, undefined).over(), true);
+  },
+);
+
+test(
+  "a task keeps running while a worker's threads outlive its main thread",
+  { skip: process.platform !== "linux" || spawnSync("python3", ["-V"]).status !== 0 },
+  async (t) => {
+    const exits: BackgroundExit[] = [];
+    const tasks = new BackgroundTasks((exit) => exits.push(exit));
+    t.after(() => tasks.stopAll(200));
+    // The main thread calls pthread_exit, so /proc/<pid>/stat shows a zombie
+    // while another thread keeps working.
+    const script = [
+      "import ctypes, os, sys, threading, time",
+      "threading.Thread(target=lambda: time.sleep(30)).start()",
+      "print(f'worker={os.getpid()}', flush=True)",
+      "sys.stdout.close(); sys.stderr.close()",
+      "ctypes.CDLL(None).pthread_exit(None)",
+    ].join("\n");
+    const info = tasks.add({
+      kind: "host",
+      command: "",
+      cwd: tmpdir(),
+      child: sh(`python3 -c "${script}" &`),
+      bufferBytes: 1024,
+      visibleBytes: 1024,
+    });
+    await until(() => /worker=\d+/.test(tasks.logs(info.id)!.text));
+    const worker = Number(/worker=(\d+)/.exec(tasks.logs(info.id)!.text)![1]);
+    t.after(() => {
+      try {
+        process.kill(worker, "SIGKILL");
+      } catch {}
+    });
+    await until(() => {
+      try {
+        return readFileSync(`/proc/${worker}/stat`, "utf8").split(") ")[1]!.startsWith("Z");
+      } catch {
+        return false;
+      }
+    });
+    // Several watch periods: two matching scans would have ended it before.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    assert.equal(tasks.get(info.id)?.state, "running");
+    const stopped = await tasks.stop(info.id, 200);
+    assert.equal(stopped?.state, "exited");
+    await until(() => !alive(worker));
+    assert.equal(exits.length, 0);
   },
 );
 

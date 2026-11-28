@@ -67,7 +67,10 @@ export class ProcessCensus {
         const pgrp = Number(fields[2]);
         if (!Number.isInteger(pgrp)) continue;
         const members = groups.get(pgrp) ?? { live: false, zombies: [] };
-        if (fields[0] === "Z" || fields[0] === "X") members.zombies.push(Number(entry));
+        // A dead main thread shows as a zombie while its other threads run
+        // on (num_threads, field 20), so only a lone thread counts.
+        const zombie = (fields[0] === "Z" || fields[0] === "X") && Number(fields[17]) <= 1;
+        if (zombie) members.zombies.push(Number(entry));
         else members.live = true;
         groups.set(pgrp, members);
       }

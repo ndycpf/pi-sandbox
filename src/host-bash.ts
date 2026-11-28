@@ -10,9 +10,14 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
+import type { BackgroundTasks } from "./background.ts";
 import type { ReviewExec } from "./host-review-tools.ts";
 
-import { DEFAULT_HOST_BASH_CONFIG, type HostBashConfig } from "./config.ts";
+import {
+  type BackgroundBashConfig,
+  DEFAULT_HOST_BASH_CONFIG,
+  type HostBashConfig,
+} from "./config.ts";
 import { REJECTION_INSTRUCTIONS } from "./host-review-prompt.ts";
 import {
   appendReviewLog,
@@ -88,11 +93,15 @@ function outputPolicy(options: HostBashConfig) {
 }
 
 // The approval prompt's text. Throws if the operator could not read all of it.
-function promptTitle(command: string, cwd: string, options: HostBashConfig) {
+function promptTitle(command: string, cwd: string, options: HostBashConfig, background = false) {
   const output = outputPolicy(options);
   const header = [
-    "Run outside the OS sandbox? Host files and network are reachable.",
-    `${shell}, limit ${options.timeoutSeconds}s, ${output}.`,
+    background
+      ? "Run IN THE BACKGROUND outside the OS sandbox? Host files and network are reachable."
+      : "Run outside the OS sandbox? Host files and network are reachable.",
+    background
+      ? `${shell}, no time limit, runs until stopped or Pi exits, ${output}.`
+      : `${shell}, limit ${options.timeoutSeconds}s, ${output}.`,
     "CWD: " + quoted(cwd),
   ];
   const shown = command.split("\n").map(quoted);
@@ -190,6 +199,11 @@ export type HostBashDeps = {
   logFile?: string;
   /** Runs the reviewer's read and ls in the sandbox, read-only and offline. */
   reviewExec?: ReviewExec;
+  /**
+   * Background task registry. With it and `hostBash.allowBackground`, the tool
+   * takes `background: true` and hands the approved process to it.
+   */
+  background?: { tasks: BackgroundTasks; limits: (cwd: string) => BackgroundBashConfig };
 };
 
 export function registerHostBash(
@@ -223,6 +237,21 @@ export function registerHostBash(
     );
   };
 
+  // hostBash is global-only, so the registration cwd does not change it.
+  const background = config(process.cwd()).allowBackground ? deps.background : undefined;
+  const backgroundParameter = background
+    ? {
+        background: Type.Optional(
+          Type.Boolean({
+            description:
+              "Start a long-running command (a dev server, a watcher) and return at once with a task id; " +
+              "manage it with bash_background list, logs and stop. No time limit; stopped when the session ends.",
+          }),
+        ),
+      }
+    : {};
+  // Only the base fields are typed; `background` is read through a cast.
+  const extraParameters = backgroundParameter as Record<never, never>;
   pi.registerTool({
     name: "host_bash",
     label: "Host Bash",
@@ -236,7 +265,11 @@ export function registerHostBash(
       "Pass `reason`: one sentence on why this needs the host; the reviewer reads it. " +
       "Keep the command short and self-contained: the approval prompt must fit an 80x24 terminal, so a command over about 8 short lines is refused without prompting and must be shortened or split. " +
       "Runs non-interactively with stdin closed, Pi's PATH and HOME (no other environment variables), and a time limit. " +
-      "Returns the exit status and, when enabled, the tail of combined stdout/stderr.",
+      "Returns the exit status and, when enabled, the tail of combined stdout/stderr." +
+      (background
+        ? " With `background: true` the approved command keeps running outside the sandbox after the call returns; " +
+          "the call returns a task id for bash_background list, logs and stop."
+        : ""),
     promptSnippet: "Ask the operator to run one Bash command outside the sandbox",
     promptGuidelines: [
       "When sandboxed bash is blocked or misleading because of the sandbox (permission errors, blocked network, a host tool not found, an unreachable daemon, invalid credentials), do not give up or report the sandboxed result as the host state: call host_bash with the same command and say in one sentence why host access is needed.",
@@ -251,8 +284,12 @@ export function registerHostBash(
           description: "One sentence on why this command needs the host instead of the sandbox.",
         }),
       ),
+      ...extraParameters,
     }),
-    async execute(_id, { command, reason }, abort, _update, ctx) {
+    async execute(_id, params, abort, _update, ctx) {
+      const { command, reason } = params;
+      const inBackground =
+        background !== undefined && (params as { background?: boolean }).background === true;
       const active = session;
       const options = config(ctx.cwd);
       const current = () =>
@@ -284,6 +321,15 @@ export function registerHostBash(
         throw new Error(refusal);
       }
       if (!options.enabled) throw new Error(refusal);
+      if (inBackground) {
+        const { maxTasks } = background.limits(ctx.cwd);
+        if (background.tasks.running() >= maxTasks) {
+          throw new ApprovalRefused(
+            `Host command refused before prompting: ${maxTasks} background tasks are already running ` +
+              "(backgroundBash.maxTasks). Stop one with bash_background stop first.",
+          );
+        }
+      }
       busy = true;
       let fd: number | undefined;
       let started = false;
@@ -299,7 +345,7 @@ export function registerHostBash(
         const path = hostPath();
         // Checked before any review, so a call the operator could not read is
         // never auto-approved either.
-        const title = promptTitle(command, cwd, options);
+        const title = promptTitle(command, cwd, options, inBackground);
         lifetime.throwIfAborted();
         const review = options.review;
         let approvedBy: "operator" | "reviewer" = "operator";
@@ -312,7 +358,9 @@ export function registerHostBash(
             ...(reason && { justification: reason }),
             tty: false,
             env: { PATH: path, ...(process.env.HOME && { HOME: process.env.HOME }) },
-            timeout_seconds: options.timeoutSeconds,
+            ...(inBackground
+              ? { run_in_background: true as const }
+              : { timeout_seconds: options.timeoutSeconds }),
             output_to_agent: outputPolicy(options),
           };
           const verdict = await reviewCommand(
@@ -411,6 +459,53 @@ export function registerHostBash(
           report.once("close", () => done(text === "ok"));
           report.once("error", () => done(false));
         });
+        if (inBackground) {
+          const exited = new Promise<false>((done) => child.once("exit", () => done(false)));
+          const failed = new Promise<false>((done) => child.once("error", () => done(false)));
+          child.once("spawn", () => {
+            started = true;
+          });
+          const stopEarly = () => {
+            if (child.pid) {
+              try {
+                process.kill(-child.pid, "SIGKILL");
+              } catch {
+                child.kill("SIGKILL");
+              }
+            }
+          };
+          lifetime.addEventListener("abort", stopEarly, { once: true });
+          try {
+            if (!(await Promise.race([verified, exited, failed])) || lifetime.aborted) {
+              stopEarly();
+              throw new ApprovalRefused(
+                "Host command refused: the working directory changed before execution, or the call was cancelled.",
+              );
+            }
+          } finally {
+            lifetime.removeEventListener("abort", stopEarly);
+            report?.destroy();
+          }
+          const info = background.tasks.add({
+            kind: "host",
+            command,
+            cwd,
+            child,
+            bufferBytes: Math.max(options.outputBytes, 4096),
+            visibleBytes: options.outputBytes,
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Started host background task ${info.id} (pid ${info.pid ?? "?"}) outside the sandbox. ` +
+                  "Use bash_background logs or stop with this id. It is stopped when the session ends.",
+              },
+            ],
+            details: { taskId: info.id, approvedBy },
+          };
+        }
         const closed = new Promise<void>((done) => child.once("close", () => done()));
         for (const stream of [child.stdout, child.stderr]) {
           stream?.on("data", (chunk: Buffer) => tail?.push(chunk));

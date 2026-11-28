@@ -281,6 +281,41 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
   });
 }
 
+/**
+ * Wrap `command` for the sandbox and spawn it detached, in its own process
+ * group, with stdout and stderr piped. The caller must call
+ * `manager.cleanupAfterCommand()` once the child has exited: on Linux the
+ * runtime keeps the mount points that enforce deny rules until then.
+ */
+export async function spawnSandboxed(
+  manager: ISandboxManager,
+  command: string,
+  cwd: string,
+  options: { shellPath?: string; sshProxy?: boolean; env?: NodeJS.ProcessEnv } = {},
+): Promise<ChildProcess> {
+  if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
+
+  const { shell, args } = getShellConfig(options.shellPath);
+
+  // OpenSSH does not honor ALL_PROXY, unlike most of the tools that use
+  // the sandbox network proxy. Install a shell function so ordinary
+  // `ssh host` commands use the runtime's local SOCKS proxy too. This is
+  // deliberately opt-in at the config layer, but enabled by default.
+  const socksProxyPort = options.sshProxy !== false ? manager.getSocksProxyPort() : undefined;
+  const sshProxyCommand =
+    process.platform === "darwin" && socksProxyPort !== undefined
+      ? `ssh() { /usr/bin/ssh -o 'ProxyCommand=/usr/bin/nc -X 5 -x localhost:${socksProxyPort} %h %p' "$@"; }; `
+      : "";
+  const wrappedCommand = await manager.wrapWithSandbox(`${sshProxyCommand}${command}`, shell);
+
+  return spawn(shell, [...args, wrappedCommand], {
+    cwd,
+    env: options.env,
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
 export function createSandboxedBashOps(
   manager: ISandboxManager,
   shellPath?: string,
@@ -288,27 +323,7 @@ export function createSandboxedBashOps(
 ): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout, env }) {
-      if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
-
-      const { shell, args } = getShellConfig(shellPath);
-
-      // OpenSSH does not honor ALL_PROXY, unlike most of the tools that use
-      // the sandbox network proxy. Install a shell function so ordinary
-      // `ssh host` commands use the runtime's local SOCKS proxy too. This is
-      // deliberately opt-in at the config layer, but enabled by default.
-      const socksProxyPort = sshProxy ? manager.getSocksProxyPort() : undefined;
-      const sshProxyCommand =
-        process.platform === "darwin" && socksProxyPort !== undefined
-          ? `ssh() { /usr/bin/ssh -o 'ProxyCommand=/usr/bin/nc -X 5 -x localhost:${socksProxyPort} %h %p' "$@"; }; `
-          : "";
-      const wrappedCommand = await manager.wrapWithSandbox(`${sshProxyCommand}${command}`, shell);
-
-      const child = spawn(shell, [...args, wrappedCommand], {
-        cwd,
-        env,
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      const child = await spawnSandboxed(manager, command, cwd, { shellPath, sshProxy, env });
 
       let timedOut = false;
       let timeoutHandle: NodeJS.Timeout | undefined;

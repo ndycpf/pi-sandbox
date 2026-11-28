@@ -1,7 +1,10 @@
+import { spawn } from "node:child_process";
+
 import { createSandboxManager } from "@carderne/sandbox-runtime";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
+  getShellConfig,
   isToolCallEventType,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -9,11 +12,18 @@ import { Key } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import {
+  BACKGROUND_TOOL,
+  BackgroundTasks,
+  exitMessage,
+  registerBackgroundTool,
+} from "./background.ts";
+import {
   addDomainToConfig,
   addReadPathToConfig,
   addWritePathToConfig,
   getConfigPaths,
   loadConfig,
+  resolveBackgroundBashConfig,
   resolveHostBashConfig,
 } from "./config.ts";
 import { registerHostBash } from "./host-bash.ts";
@@ -28,6 +38,7 @@ import {
   createReviewSandbox,
   createSandboxedBashOps,
   initializeSandbox,
+  spawnSandboxed,
   updateSandboxConfig,
   resolveAllowances,
   type SessionAllowances,
@@ -69,6 +80,19 @@ export default function (pi: ExtensionAPI) {
   let hostBash: ReturnType<typeof registerHostBash> | undefined;
   let projectTrusted = false;
   const allowances: SessionAllowances = { domains: [], readPaths: [], writePaths: [] };
+  // Long-running tasks belong to this session and this sandbox: they are
+  // stopped on shutdown and whenever the sandbox is turned on or off.
+  const backgroundTasks = new BackgroundTasks((exit) => {
+    try {
+      pi.sendMessage(
+        { customType: "bash-background", content: exitMessage(exit), display: true },
+        { deliverAs: "steer" },
+      );
+    } catch {
+      // The session may be gone.
+    }
+  });
+  let backgroundToolRegistered = false;
 
   const effectiveAllowances = (cwd: string) =>
     resolveAllowances(loadConfig(cwd, projectTrusted), allowances);
@@ -137,6 +161,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     hostBash?.start(ctx);
+    // Tasks started while the sandbox was off must not keep running unsandboxed.
+    await backgroundTasks.stopAll();
     try {
       await initializeSandbox(sandboxManager, config, allowances, ctx.cwd);
       if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
@@ -169,6 +195,7 @@ export default function (pi: ExtensionAPI) {
 
     hostBash?.stop();
     cancelPermissionPrompts(pi);
+    await backgroundTasks.stopAll();
     if (sandboxInitialized) {
       try {
         await reviewSandbox.reset();
@@ -332,6 +359,43 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  async function startBackground(command: string, ctx: Parameters<typeof showPermissionPrompt>[1]) {
+    const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted });
+    const prefix = settings.getShellCommandPrefix();
+    const full = prefix ? `${prefix}\n${command}` : command;
+    const config = loadConfig(ctx.cwd, projectTrusted);
+    const limits = resolveBackgroundBashConfig(config.backgroundBash);
+    const common = {
+      command,
+      cwd: ctx.cwd,
+      bufferBytes: limits.bufferBytes,
+      visibleBytes: limits.outputBytes,
+    };
+    if (sandboxEnabled && sandboxInitialized) {
+      const child = await spawnSandboxed(sandboxManager, full, ctx.cwd, {
+        shellPath: settings.getShellPath(),
+        sshProxy: config.network?.sshProxy !== false,
+        env: process.env,
+      });
+      return backgroundTasks.add({
+        ...common,
+        kind: "sandbox",
+        child,
+        // Linux deny rules rely on mount points the runtime keeps until this runs.
+        cleanup: () => sandboxManager.cleanupAfterCommand(),
+      });
+    }
+    // With the sandbox off, ordinary bash is unsandboxed too.
+    const { shell, args } = getShellConfig(settings.getShellPath());
+    const child = spawn(shell, [...args, full], {
+      cwd: ctx.cwd,
+      env: process.env,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return backgroundTasks.add({ ...common, kind: "unsandboxed", child });
+  }
+
   pi.registerTool({
     ...localBash,
     label: "bash (sandboxed)",
@@ -418,8 +482,15 @@ export default function (pi: ExtensionAPI) {
     if (!config.enabled) return;
     const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
 
-    if (sandboxInitialized && !config.network?.disabled && isToolCallEventType("bash", event)) {
-      for (const domain of extractDomainsFromCommand(event.input.command)) {
+    const bashCommand = isToolCallEventType("bash", event)
+      ? event.input.command
+      : event.toolName === BACKGROUND_TOOL &&
+          (event.input as { action?: string }).action === "start" &&
+          typeof (event.input as { command?: unknown }).command === "string"
+        ? (event.input as { command: string }).command
+        : undefined;
+    if (sandboxInitialized && !config.network?.disabled && bashCommand !== undefined) {
+      for (const domain of extractDomainsFromCommand(bashCommand)) {
         if (!domainIsAllowed(domain, effectiveDomains(ctx.cwd))) {
           const choice = await promptDomainBlock(
             pi,
@@ -482,6 +553,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     hostBash?.stop();
+    await backgroundTasks.stopAll();
     projectTrusted = ctx.isProjectTrusted();
     if (loadConfig(ctx.cwd, projectTrusted).enableAccessRequestTool === true) {
       registerAccessTools();
@@ -493,8 +565,28 @@ export default function (pi: ExtensionAPI) {
         // hostBash is global-only, so project trust does not change it.
         (cwd) => resolveHostBashConfig(loadConfig(cwd, false).hostBash),
         // The auto-reviewer reads through the sandbox, read-only and offline.
-        { reviewExec: reviewSandbox.exec },
+        {
+          reviewExec: reviewSandbox.exec,
+          background: {
+            tasks: backgroundTasks,
+            limits: (cwd) =>
+              resolveBackgroundBashConfig(loadConfig(cwd, projectTrusted).backgroundBash),
+          },
+        },
       );
+    }
+    const startupConfig = loadConfig(ctx.cwd, projectTrusted);
+    const hostBackground =
+      startupConfig.hostBash?.enabled === true && startupConfig.hostBash.allowBackground === true;
+    if (!backgroundToolRegistered && (startupConfig.backgroundBash?.enabled || hostBackground)) {
+      backgroundToolRegistered = true;
+      registerBackgroundTool(pi, {
+        tasks: backgroundTasks,
+        config: (cwd) =>
+          resolveBackgroundBashConfig(loadConfig(cwd, projectTrusted).backgroundBash),
+        hostBackground,
+        start: startBackground,
+      });
     }
     if (pi.getFlag("no-sandbox") as boolean) {
       sandboxEnabled = false;
@@ -513,6 +605,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     hostBash?.stop();
     cancelPermissionPrompts(pi);
+    await backgroundTasks.stopAll();
     if (!sandboxInitialized) return;
     try {
       await reviewSandbox.reset();

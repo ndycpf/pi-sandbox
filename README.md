@@ -198,7 +198,10 @@ restart Pi after enabling it.
     "outputBytes": 16384,
     // Pi modes that may answer the prompt (default ["tui", "rpc"]).
     // Remove "rpc" to refuse host_bash in RPC clients.
-    "approvalModes": ["tui", "rpc"]
+    "approvalModes": ["tui", "rpc"],
+    // Let host_bash start long-running commands with background: true
+    // (default false). See "Host background tasks" below.
+    "allowBackground": false
   }
 }
 ```
@@ -380,6 +383,66 @@ transcript (up to roughly 30k tokens) and the files it reads to the model
 provider you configured. Use auto-review for convenience
 on a machine and model you trust, not as a security boundary; keep `mode:
 "human"` where a wrong `allow` would be costly.
+
+### Background tasks
+
+Ordinary `bash` waits for its command. On Linux, anything the command leaves
+running with `&`, `nohup` or `setsid` is killed as soon as the command returns,
+because bubblewrap ends the sandbox's PID namespace with it. On macOS such
+processes survive and stay sandboxed, but Pi no longer tracks them. For dev
+servers, watchers and long builds, enable `bash_background` instead:
+
+```jsonc
+{
+  "backgroundBash": {
+    "enabled": true,
+    // Background tasks (sandboxed and host) running at once (1-32, default 4).
+    "maxTasks": 4,
+    // Combined output kept in memory per task (4 KiB-64 MiB, default 1 MiB).
+    "bufferBytes": 1048576,
+    // Tail of a task's output the agent sees by default (0-1 MiB, default 16 KiB).
+    "outputBytes": 16384
+  }
+}
+```
+
+It can be set in the global or the project config, since the tasks run in the
+same sandbox as `bash`. The tool is registered at session start, so restart Pi
+after enabling it. The agent calls it with an `action`:
+
+- `start` runs `command` in the sandbox and returns a task id at once. Domains
+  in the command are checked and prompted for like a `bash` command.
+- `list` shows the tasks, `logs` the tail of a task's combined stdout/stderr,
+  and `stop` sends SIGTERM to the task's process group, then SIGKILL after 2
+  seconds.
+
+When a task exits on its own, its status and output tail are added to the
+conversation. Every task is stopped when the session ends (including `/new`
+and Pi exiting) and whenever the sandbox is turned on or off, so a task never
+outlives the sandbox it started in. Filesystem rules are fixed when a task
+starts; domains granted later apply to it, since the network proxy is shared.
+While the sandbox is off, `start` runs the command without a sandbox, like
+`bash`, and `list` marks it as such. A process that leaves the task's process
+group (for example with `setsid` on macOS) is not stopped by `stop`.
+
+#### Host background tasks
+
+With `hostBash.allowBackground: true` in the **global** config, `host_bash`
+also takes `background: true`. The command is approved exactly like any other
+`host_bash` call (by you, or by auto-review when that is on), and the prompt
+says it will run in the background with no time limit. Once approved it runs
+outside the sandbox until it exits, is stopped with `bash_background stop`, or
+the session ends; `hostBash.timeoutSeconds` does not apply. The agent sees at
+most `hostBash.outputBytes` of its output. `backgroundBash.maxTasks` counts
+host tasks too, and the `bash_background` tool is registered for them even
+when `backgroundBash.enabled` is false (then it can list, read and stop tasks,
+but not start sandboxed ones).
+
+```jsonc
+{
+  "hostBash": { "enabled": true, "allowBackground": true }
+}
+```
 
 ### What is prompted vs. hard-blocked
 

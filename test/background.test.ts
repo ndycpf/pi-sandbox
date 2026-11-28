@@ -1,0 +1,384 @@
+import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+
+import { spawn } from "node:child_process";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { type TestContext } from "node:test";
+
+import { createSandboxManager } from "@carderne/sandbox-runtime";
+import assert from "node:assert/strict";
+
+import {
+  type BackgroundExit,
+  BackgroundTasks,
+  OutputTail,
+  registerBackgroundTool,
+} from "../src/background.ts";
+import {
+  DEFAULT_BACKGROUND_BASH_CONFIG,
+  DEFAULT_CONFIG,
+  DEFAULT_HOST_BASH_CONFIG,
+  mergeConfigLayers,
+  resolveBackgroundBashConfig,
+} from "../src/config.ts";
+import { registerHostBash } from "../src/host-bash.ts";
+import { initializeSandbox, spawnSandboxed } from "../src/sandbox-runtime.ts";
+
+const unix = ["linux", "darwin"].includes(process.platform);
+
+function sh(command: string, cwd = tmpdir()) {
+  return spawn("/bin/sh", ["-c", command], {
+    cwd,
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+async function until(check: () => boolean, ms = 5000) {
+  const end = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > end) throw new Error("timed out waiting");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+function alive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("output tail keeps the last bytes", () => {
+  const tail = new OutputTail(8);
+  tail.push(Buffer.from("hello "));
+  tail.push(Buffer.from("world!"));
+  assert.equal(tail.total, 12);
+  assert.equal(tail.text(), "o world!");
+  assert.equal(tail.text(3), "ld!");
+});
+
+test("backgroundBash config is validated and merged across layers", () => {
+  assert.deepEqual(resolveBackgroundBashConfig(undefined), DEFAULT_BACKGROUND_BASH_CONFIG);
+  assert.deepEqual(
+    resolveBackgroundBashConfig({ enabled: "yes", maxTasks: 0, bufferBytes: 1, outputBytes: 0 }),
+    { ...DEFAULT_BACKGROUND_BASH_CONFIG, outputBytes: 0 },
+  );
+  const merged = mergeConfigLayers(
+    DEFAULT_CONFIG,
+    { backgroundBash: { maxTasks: 2 } },
+    { backgroundBash: { enabled: true } },
+  );
+  assert.deepEqual(merged.backgroundBash, {
+    ...DEFAULT_BACKGROUND_BASH_CONFIG,
+    enabled: true,
+    maxTasks: 2,
+  });
+});
+
+test("hostBash.allowBackground is global-only", () => {
+  const merged = mergeConfigLayers(
+    DEFAULT_CONFIG,
+    { hostBash: { enabled: true } },
+    { hostBash: { allowBackground: true } },
+  );
+  assert.equal(merged.hostBash?.allowBackground, false);
+  const global = mergeConfigLayers(
+    DEFAULT_CONFIG,
+    { hostBash: { enabled: true, allowBackground: true } },
+    {},
+  );
+  assert.equal(global.hostBash?.allowBackground, true);
+});
+
+test(
+  "tasks keep output, report their own exit, and run cleanup once",
+  { skip: !unix },
+  async () => {
+    const exits: BackgroundExit[] = [];
+    const tasks = new BackgroundTasks((exit) => exits.push(exit));
+    let cleaned = 0;
+    const info = tasks.add({
+      kind: "sandbox",
+      command: "echo one; echo two >&2; exit 3",
+      cwd: tmpdir(),
+      child: sh("echo one; echo two >&2; exit 3"),
+      bufferBytes: 1024,
+      visibleBytes: 1024,
+      cleanup: () => cleaned++,
+    });
+    assert.equal(info.state, "running");
+    await until(() => tasks.get(info.id)?.state === "exited");
+    const logs = tasks.logs(info.id)!;
+    assert.match(logs.text, /one/);
+    assert.match(logs.text, /two/);
+    assert.equal(logs.info.exitCode, 3);
+    assert.equal(cleaned, 1);
+    assert.equal(exits.length, 1);
+    assert.equal(exits[0]!.info.id, info.id);
+    assert.equal(tasks.running(), 0);
+  },
+);
+
+test(
+  "stop kills the whole process group and is not reported as an exit",
+  { skip: !unix },
+  async () => {
+    const exits: BackgroundExit[] = [];
+    const tasks = new BackgroundTasks((exit) => exits.push(exit));
+    // The shell ignores SIGTERM, so stopping needs the SIGKILL fallback; its
+    // background child must die with the group.
+    const info = tasks.add({
+      kind: "host",
+      command: "",
+      cwd: tmpdir(),
+      child: sh("trap '' TERM; sleep 30 & echo child=$!; wait"),
+      bufferBytes: 1024,
+      visibleBytes: 1024,
+    });
+    await until(() => /child=\d+/.test(tasks.logs(info.id)!.text));
+    const childPid = Number(/child=(\d+)/.exec(tasks.logs(info.id)!.text)![1]);
+    assert.ok(alive(childPid));
+    const stopped = await tasks.stop(info.id, 200);
+    assert.equal(stopped?.state, "exited");
+    await until(() => !alive(childPid));
+    assert.equal(exits.length, 0);
+  },
+);
+
+test("stopAll stops every running task", { skip: !unix }, async () => {
+  const tasks = new BackgroundTasks();
+  const ids = [1, 2].map(
+    () =>
+      tasks.add({
+        kind: "sandbox",
+        command: "sleep 30",
+        cwd: tmpdir(),
+        child: sh("sleep 30"),
+        bufferBytes: 1024,
+        visibleBytes: 0,
+      }).id,
+  );
+  assert.equal(tasks.running(), 2);
+  await tasks.stopAll(200);
+  assert.equal(tasks.running(), 0);
+  for (const id of ids) assert.equal(tasks.get(id)?.state, "exited");
+});
+
+function backgroundTool(
+  tasks: BackgroundTasks,
+  config = { ...DEFAULT_BACKGROUND_BASH_CONFIG, enabled: true },
+) {
+  let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
+  registerBackgroundTool(
+    { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,
+    {
+      tasks,
+      config: () => config,
+      hostBackground: false,
+      start: async (command, ctx) =>
+        tasks.add({
+          kind: "sandbox",
+          command,
+          cwd: ctx.cwd,
+          child: sh(command, ctx.cwd),
+          bufferBytes: config.bufferBytes,
+          visibleBytes: config.outputBytes,
+        }),
+    },
+  );
+  const ctx = { cwd: tmpdir() } as unknown as ExtensionToolContext;
+  const call = async (params: Record<string, unknown>) => {
+    const result = await tool.execute("t", params, undefined, undefined, ctx);
+    const [content] = result.content;
+    return content?.type === "text" ? content.text : "";
+  };
+  return call;
+}
+
+test("bash_background starts, lists, shows logs and stops tasks", { skip: !unix }, async () => {
+  const tasks = new BackgroundTasks();
+  const call = backgroundTool(tasks);
+  const started = await call({ action: "start", command: "echo ready; exec sleep 30" });
+  assert.match(started, /^Started bg1 \[running\] in the sandbox/);
+  await until(() => tasks.logs("bg1")!.text.includes("ready"));
+  assert.match(await call({ action: "list" }), /bg1 \[running\]/);
+  assert.match(await call({ action: "logs", id: "bg1" }), /ready/);
+  assert.match(await call({ action: "stop", id: "bg1" }), /Stopped: bg1 \[exited/);
+  await assert.rejects(call({ action: "logs", id: "bg9" }), /Unknown background task/);
+  await assert.rejects(call({ action: "stop" }), /needs an id/);
+});
+
+test(
+  "bash_background refuses start when disabled or at the task limit",
+  { skip: !unix },
+  async () => {
+    const tasks = new BackgroundTasks();
+    const disabled = backgroundTool(tasks, DEFAULT_BACKGROUND_BASH_CONFIG);
+    await assert.rejects(disabled({ action: "start", command: "true" }), /disabled/);
+    const limited = backgroundTool(tasks, {
+      ...DEFAULT_BACKGROUND_BASH_CONFIG,
+      enabled: true,
+      maxTasks: 1,
+    });
+    await limited({ action: "start", command: "sleep 30" });
+    await assert.rejects(limited({ action: "start", command: "sleep 30" }), /Too many/);
+    await tasks.stopAll(200);
+  },
+);
+
+test(
+  "a sandboxed background task outlives its start call and stays sandboxed",
+  { skip: !unix, timeout: 20_000 },
+  async (t: TestContext) => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-bg-sandbox-")));
+    const manager = createSandboxManager();
+    t.after(async () => {
+      await manager.reset();
+      rmSync(cwd, { recursive: true, force: true });
+    });
+    const config = {
+      ...DEFAULT_CONFIG,
+      network: { ...DEFAULT_CONFIG.network!, allowAllUnixSockets: true },
+      filesystem: { denyRead: [], allowRead: [cwd], allowWrite: [cwd], denyWrite: [] },
+    };
+    try {
+      await initializeSandbox(manager, config, undefined, cwd);
+    } catch (error) {
+      t.skip(`sandbox unavailable: ${String(error)}`);
+      return;
+    }
+    const tasks = new BackgroundTasks();
+    let cleaned = 0;
+    const probe =
+      "(: > outside-probe) 2>/dev/null; touch /usr/pi-bg-escape 2>/dev/null && echo escaped || echo blocked; echo ready; exec sleep 30";
+    const info = tasks.add({
+      kind: "sandbox",
+      command: probe,
+      cwd,
+      child: await spawnSandboxed(manager, probe, cwd, { env: process.env }),
+      bufferBytes: 4096,
+      visibleBytes: 4096,
+      cleanup: () => {
+        cleaned++;
+        manager.cleanupAfterCommand();
+      },
+    });
+    try {
+      await until(
+        () => /ready/.test(tasks.logs(info.id)!.text) || tasks.get(info.id)?.state === "exited",
+      );
+    } catch {
+      // Fall through to the skip below.
+    }
+    if (!/ready/.test(tasks.logs(info.id)!.text)) {
+      await tasks.stopAll(200);
+      t.skip(`sandbox cannot run here: ${tasks.logs(info.id)!.text}`);
+      return;
+    }
+    assert.match(tasks.logs(info.id)!.text, /blocked/);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(tasks.get(info.id)?.state, "running");
+    assert.equal(cleaned, 0);
+    await tasks.stop(info.id, 500);
+    assert.equal(cleaned, 1);
+  },
+);
+
+function hostFixture(
+  t: TestContext,
+  options: { allowBackground: boolean; select?: (title: string) => string },
+) {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-bg-")));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  for (const stream of [process.stdin, process.stdout]) {
+    const previous = Object.getOwnPropertyDescriptor(stream, "isTTY");
+    Object.defineProperty(stream, "isTTY", { configurable: true, value: true });
+    t.after(() =>
+      previous
+        ? Object.defineProperty(stream, "isTTY", previous)
+        : Reflect.deleteProperty(stream, "isTTY"),
+    );
+  }
+  const tasks = new BackgroundTasks();
+  t.after(() => tasks.stopAll(200));
+  let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
+  const host = registerHostBash(
+    { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,
+    () => true,
+    () => ({
+      ...DEFAULT_HOST_BASH_CONFIG,
+      enabled: true,
+      timeoutSeconds: 1,
+      allowBackground: options.allowBackground,
+    }),
+    {
+      background: {
+        tasks,
+        limits: () => ({ ...DEFAULT_BACKGROUND_BASH_CONFIG, maxTasks: 1 }),
+      },
+    },
+  );
+  const titles: string[] = [];
+  const ctx = {
+    cwd,
+    mode: "tui",
+    hasUI: true,
+    sessionManager: { getSessionId: () => "fixture" },
+    ui: {
+      select: async (title: string) => {
+        titles.push(title);
+        return options.select ? options.select(title) : "Allow once";
+      },
+      notify: () => {},
+    },
+  } as unknown as ExtensionToolContext;
+  host.start(ctx);
+  t.after(() => host.stop());
+  const run = async (params: Record<string, unknown>) => {
+    const result = await tool.execute("t", params, undefined, undefined, ctx);
+    const [content] = result.content;
+    return { text: content?.type === "text" ? content.text : "", details: result.details };
+  };
+  return { tool: () => tool, tasks, titles, run };
+}
+
+test(
+  "host_bash background runs an approved command past the time limit",
+  { skip: !unix, timeout: 15_000 },
+  async (t) => {
+    const { tool, tasks, titles, run } = hostFixture(t, { allowBackground: true });
+    assert.ok("background" in (tool().parameters as { properties: object }).properties);
+    const result = await run({ command: "echo up; exec sleep 30", background: true });
+    assert.match(result.text, /Started host background task bg1/);
+    assert.deepEqual(result.details, { taskId: "bg1", approvedBy: "operator" });
+    assert.match(titles[0]!, /IN THE BACKGROUND/);
+    assert.match(titles[0]!, /no time limit/);
+    // Longer than hostBash.timeoutSeconds (1s): background runs are not limited.
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    assert.equal(tasks.get("bg1")?.kind, "host");
+    assert.equal(tasks.get("bg1")?.state, "running");
+    assert.match(tasks.logs("bg1")!.text, /up/);
+    await assert.rejects(
+      run({ command: "sleep 30", background: true }),
+      /background tasks are already running/,
+    );
+    await tasks.stop("bg1", 200);
+  },
+);
+
+test("host_bash background needs approval and the global opt-in", { skip: !unix }, async (t) => {
+  const denied = hostFixture(t, { allowBackground: true, select: () => "Deny" });
+  await assert.rejects(denied.run({ command: "sleep 30", background: true }), /refused/);
+  assert.equal(denied.tasks.running(), 0);
+
+  const off = hostFixture(t, { allowBackground: false });
+  assert.ok(!("background" in (off.tool().parameters as { properties: object }).properties));
+  // Without the opt-in the flag is ignored and the command runs in the foreground.
+  const result = await off.run({ command: "echo fg", background: true });
+  assert.match(result.text, /exit status: 0/);
+  assert.equal(off.tasks.running(), 0);
+});

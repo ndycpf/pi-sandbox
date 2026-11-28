@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import assert from "node:assert/strict";
 
+import { sessionLivenessRegistry } from "../src/background.ts";
 import extension from "../src/extension.ts";
 
 const unix = ["linux", "darwin"].includes(process.platform);
@@ -34,6 +35,8 @@ async function harness(t: TestContext, mode: "tui" | "rpc") {
   const widgets = new Map<string, unknown>();
   const notes: string[] = [];
   let pick: (options: string[]) => string | undefined = () => undefined;
+  const selects: { title: string; options: string[] }[] = [];
+  const confirms: string[] = [];
   const api = {
     on: (name: string, handler: (event: unknown, ctx: ExtensionToolContext) => unknown) =>
       handlers.set(name, handler),
@@ -54,7 +57,14 @@ async function harness(t: TestContext, mode: "tui" | "rpc") {
       notify: (message: string) => notes.push(message),
       setStatus: (key: string, text: string | undefined) => status.set(key, text),
       setWidget: (key: string, lines: unknown) => widgets.set(key, lines),
-      select: async (_title: string, options: string[]) => pick(options),
+      select: async (title: string, options: string[]) => {
+        selects.push({ title, options });
+        return pick(options);
+      },
+      confirm: async (title: string) => {
+        confirms.push(title);
+        return true;
+      },
       theme: { fg: (color: string, text: string) => `<${color}>${text}` },
     },
   } as unknown as ExtensionToolContext;
@@ -67,7 +77,12 @@ async function harness(t: TestContext, mode: "tui" | "rpc") {
     rmSync(root, { recursive: true, force: true });
   });
   const tool = tools.get("bash_background")!;
+  const sessionId = ctx.sessionManager.getSessionId();
   return {
+    selects,
+    confirms,
+    alive: () => sessionLivenessRegistry().hasActiveProvider({ sessionId }),
+    shutdown: () => handlers.get("session_shutdown")!({ reason: "quit" }, ctx),
     status,
     widgets,
     notes,
@@ -94,7 +109,9 @@ for (const mode of ["tui", "rpc"] as const) {
     ]);
 
     await ui.command("");
-    assert.match(ui.notes.at(-1)!, /bg1 \[running\][\s\S]*bg2 \[running\]/);
+    // RPC lists in a dialog, since some clients drop notifications.
+    const listed = mode === "tui" ? ui.notes.at(-1)! : ui.selects.at(-1)!.options.join("\n");
+    assert.match(listed, /bg1 \[running\][\s\S]*bg2 \[running\]/);
 
     // Without an id, stop asks which task: Pi's selector, or the RPC select dialog.
     ui.setPick((options) => options.find((line) => line.startsWith("bg1 ")));
@@ -107,3 +124,28 @@ for (const mode of ["tui", "rpc"] as const) {
     assert.equal(ui.widgets.get("background"), undefined);
   });
 }
+
+test("RPC hosts see the session as busy while tasks run", { skip: !unix }, async (t) => {
+  const ui = await harness(t, "rpc");
+  assert.equal(ui.alive(), false);
+  await ui.start("exec sleep 30");
+  assert.equal(ui.alive(), true);
+  await ui.command("stop all");
+  assert.equal(ui.alive(), false);
+  await ui.start("exec sleep 30");
+  await ui.shutdown();
+  assert.equal(ui.alive(), false);
+});
+
+test("/background lists tasks in a dialog in RPC mode", { skip: !unix }, async (t) => {
+  const ui = await harness(t, "rpc");
+  await ui.command("");
+  assert.deepEqual(ui.selects.at(-1), { title: "No background tasks.", options: ["Close"] });
+  await ui.start("exec sleep 30");
+  ui.setPick((options) => options[0]);
+  await ui.command("");
+  assert.match(ui.selects.at(-1)!.options[0]!, /^bg1 \[running\]/);
+  assert.equal(ui.selects.at(-1)!.options.at(-1), "Close");
+  assert.deepEqual(ui.confirms, ["Stop background task?"]);
+  assert.equal(ui.widgets.get("background"), undefined);
+});

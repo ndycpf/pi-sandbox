@@ -425,6 +425,16 @@ client. `/background` lists the tasks; `/background stop` asks which one to stop
 (Pi's selector in the TUI, a select dialog in RPC clients), and
 `/background stop <id|all>` stops without asking.
 
+**RPC clients and Orca.** Orca's native chat (and any RPC client that does the
+same) drops `notify`, `setStatus` and `setWidget` and shows only dialogs, tool
+calls and assistant text. So in RPC mode `/background` lists the tasks in a
+select dialog instead of a notification: pick a running task, confirm, and it
+is stopped. The agent's `bash_background` calls appear as tool rows there too.
+While any task runs, pi-sandbox also reports the session as busy through Pi's
+shared session-liveness registry (`@agegr/pi-web/session-liveness/v1`), which
+Orca and pi-web ask before stopping an idle Pi; without it, Orca's idle stop
+(30 minutes by default) would end the session and its tasks.
+
 When a task exits on its own, its status and output tail are added to the
 conversation. Every task is stopped when the session ends (including `/new`
 and Pi exiting) and whenever the sandbox is turned on or off, so a task never

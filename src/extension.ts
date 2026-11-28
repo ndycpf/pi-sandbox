@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 
 import { createSandboxManager } from "@carderne/sandbox-runtime";
-import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
   getShellConfig,
@@ -17,6 +17,7 @@ import {
   describeTask,
   exitMessage,
   registerBackgroundTool,
+  sessionLivenessRegistry,
   statusText,
   widgetLines,
 } from "./background.ts";
@@ -115,6 +116,25 @@ export default function (pi: ExtensionAPI) {
     },
   );
   let backgroundToolRegistered = false;
+  // Keeps RPC hosts (Orca, pi-web) from idle-stopping Pi while tasks run.
+  let releaseLiveness: (() => void) | undefined;
+  function trackLiveness(ctx: ExtensionContext) {
+    releaseLiveness?.();
+    releaseLiveness = undefined;
+    const sessionId = ctx.sessionManager?.getSessionId?.();
+    if (!sessionId) return;
+    const sessionFile = ctx.sessionManager.getSessionFile?.();
+    try {
+      releaseLiveness = sessionLivenessRegistry().register({
+        name: "pi-sandbox background tasks",
+        sessionId,
+        ...(sessionFile ? { sessionFile } : {}),
+        isActive: () => backgroundTasks.running() > 0,
+      });
+    } catch {
+      // Another extension installed an incompatible registry; nothing to keep alive then.
+    }
+  }
 
   const effectiveAllowances = (cwd: string) =>
     resolveAllowances(loadConfig(cwd, projectTrusted), allowances);
@@ -386,6 +406,26 @@ export default function (pi: ExtensionAPI) {
       description: "List background tasks, or stop them: /background stop [id|all]",
       handler: async (args, ctx) => {
         const [action = "list", target] = args.trim().split(/\s+/).filter(Boolean);
+        if (action === "list" && ctx.mode === "rpc" && ctx.hasUI) {
+          // Some RPC clients (Orca's native chat) drop notify, setStatus and
+          // setWidget and show only dialogs, so list the tasks in one.
+          const all = backgroundTasks.list();
+          if (!all.length) {
+            await ctx.ui.select("No background tasks.", ["Close"]);
+            return;
+          }
+          const lines = all.map(describeTask);
+          const choice = await ctx.ui.select("Background tasks (pick a running one to stop it)", [
+            ...lines,
+            "Close",
+          ]);
+          const task = choice === undefined ? undefined : all[lines.indexOf(choice)];
+          if (!task || task.state === "exited") return;
+          if (await ctx.ui.confirm("Stop background task?", describeTask(task))) {
+            await backgroundTasks.stop(task.id);
+          }
+          return;
+        }
         if (action === "list") {
           const all = backgroundTasks.list();
           ctx.ui.notify(
@@ -651,6 +691,7 @@ export default function (pi: ExtensionAPI) {
     const hostBackground =
       startupConfig.hostBash?.enabled === true && startupConfig.hostBash.allowBackground === true;
     backgroundUi = ctx.hasUI ? { ui: ctx.ui, tui: ctx.mode === "tui" } : undefined;
+    trackLiveness(ctx);
     if (!backgroundToolRegistered && (startupConfig.backgroundBash?.enabled || hostBackground)) {
       backgroundToolRegistered = true;
       registerBackgroundCommand();
@@ -681,6 +722,8 @@ export default function (pi: ExtensionAPI) {
     cancelPermissionPrompts(pi);
     await backgroundTasks.stopAll();
     backgroundUi = undefined;
+    releaseLiveness?.();
+    releaseLiveness = undefined;
     if (!sandboxInitialized) return;
     try {
       await reviewSandbox.reset();

@@ -13,7 +13,6 @@ import assert from "node:assert/strict";
 import {
   type BackgroundExit,
   BackgroundTasks,
-  groupHasLiveProcess,
   Reservation,
   StaleStartError,
 } from "../src/background-tasks.ts";
@@ -32,6 +31,8 @@ import {
   titleRows,
 } from "../src/host-bash.ts";
 import { OutputTail } from "../src/output-tail.ts";
+import { classifyGroup, GroupWatch, groupExists, ProcessCensus } from "../src/process-census.ts";
+import { killProcessGroup } from "../src/process-group.ts";
 import { initializeSandbox, spawnSandboxed } from "../src/sandbox-runtime.ts";
 
 const unix = ["linux", "darwin"].includes(process.platform);
@@ -492,29 +493,83 @@ test("tasks.add takes a child that already exited", { skip: !unix }, async () =>
   assert.match(exits[0]!.tail, /early/);
 });
 
-test("a process group holding only zombies counts as gone", () => {
-  const proc = mkdtempSync(join(tmpdir(), "pi-proc-"));
-  try {
-    const stat = (pid: number, comm: string, state: string, pgrp: number) => {
-      mkdirSync(join(proc, String(pid)));
-      writeFileSync(
-        join(proc, String(pid), "stat"),
-        `${pid} (${comm}) ${state} 1 ${pgrp} ${pgrp} 0 -1\n`,
-      );
-    };
-    stat(100, "worker", "Z", 100);
-    stat(101, "odd ) name", "Z", 100);
-    stat(200, "other", "S", 200);
-    mkdirSync(join(proc, "self"));
-    assert.equal(groupHasLiveProcess(100, proc), false);
-    assert.equal(groupHasLiveProcess(200, proc), true);
-    stat(102, "x) S 1 100 (y", "R", 100);
-    assert.equal(groupHasLiveProcess(100, proc), true);
-    assert.equal(groupHasLiveProcess(100, join(proc, "missing")), undefined);
-  } finally {
-    rmSync(proc, { recursive: true, force: true });
-  }
+function fakeProc(t: TestContext) {
+  const dir = mkdtempSync(join(tmpdir(), "pi-proc-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const add = (pid: number, comm: string, state: string, pgrp: number) => {
+    mkdirSync(join(dir, String(pid)), { recursive: true });
+    writeFileSync(
+      join(dir, String(pid), "stat"),
+      `${pid} (${comm}) ${state} 1 ${pgrp} ${pgrp} 0 -1\n`,
+    );
+  };
+  const remove = (pid: number) => rmSync(join(dir, String(pid)), { recursive: true, force: true });
+  return { dir, add, remove };
+}
+
+test("a /proc scan sorts processes into groups, zombies apart", async (t) => {
+  const proc = fakeProc(t);
+  proc.add(100, "worker", "Z", 100);
+  proc.add(101, "odd ) name", "Z", 100);
+  proc.add(200, "other", "S", 200);
+  proc.add(300, "x) S 1 300 (y", "R", 300);
+  mkdirSync(join(proc.dir, "self"));
+  const groups = await new ProcessCensus(proc.dir, 0).scan();
+  assert.deepEqual(classifyGroup(groups, 100), { kind: "zombies", key: "100,101" });
+  assert.deepEqual(classifyGroup(groups, 200), { kind: "live" });
+  assert.deepEqual(classifyGroup(groups, 300), { kind: "live" });
+  // A group the scan did not see is not taken for gone.
+  assert.deepEqual(classifyGroup(groups, 400), { kind: "live" });
+  assert.equal(await new ProcessCensus(join(proc.dir, "missing"), 0).scan(), undefined);
 });
+
+test("concurrent and recent callers share one /proc scan", async (t) => {
+  const proc = fakeProc(t);
+  proc.add(100, "a", "S", 100);
+  const census = new ProcessCensus(proc.dir, 10_000);
+  const [first, second] = await Promise.all([census.scan(), census.scan()]);
+  assert.equal(first, second);
+  proc.add(200, "b", "S", 200);
+  assert.equal(await census.scan(), first, "a recent scan is reused");
+  const fresh = await new ProcessCensus(proc.dir, 0).scan();
+  assert.ok(fresh?.has(200));
+});
+
+test(
+  "a group whose members a scan missed keeps its task, and zombies must hold for two scans",
+  { skip: !unix },
+  async (t) => {
+    // A real, live process group, so the cheap existence check passes; the
+    // fake /proc decides what a scan sees of it.
+    const leader = sh("sleep 30");
+    t.after(() => killProcessGroup(leader));
+    await new Promise((resolve) => leader.once("spawn", resolve));
+    const pgid = leader.pid!;
+    const proc = fakeProc(t);
+    const watch = new GroupWatch(pgid, new ProcessCensus(proc.dir, 0));
+    // A worker that was listed, then replaced by a successor the scan did not
+    // list: the group exists but no member was seen.
+    for (let i = 0; i < 3; i++) assert.equal(await watch.over(), false);
+    // One zombie seen once is not enough; a different one restarts the count.
+    proc.add(pgid + 1, "worker", "Z", pgid);
+    assert.equal(await watch.over(), false);
+    proc.remove(pgid + 1);
+    proc.add(pgid + 2, "successor", "Z", pgid);
+    assert.equal(await watch.over(), false);
+    // A live member seen in between resets it too.
+    proc.add(pgid + 3, "child", "S", pgid);
+    assert.equal(await watch.over(), false);
+    proc.remove(pgid + 3);
+    assert.equal(await watch.over(), false);
+    assert.equal(await watch.over(), true);
+    // Without a census (not Linux) an existing group is live.
+    assert.equal(await new GroupWatch(pgid, undefined).over(), false);
+    killProcessGroup(leader);
+    await new Promise((resolve) => leader.once("exit", resolve));
+    await until(() => !groupExists(pgid));
+    assert.equal(await new GroupWatch(pgid, undefined).over(), true);
+  },
+);
 
 test(
   "a task ends when only unreaped zombies are left in its group",

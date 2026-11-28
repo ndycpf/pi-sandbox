@@ -1,9 +1,8 @@
 import type { ChildProcess } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { Readable } from "node:stream";
 
 import { OutputTail } from "./output-tail.ts";
+import { GroupWatch, groupExists, type ProcessCensus, systemCensus } from "./process-census.ts";
 import { killProcessGroup } from "./process-group.ts";
 
 /** Where a background task runs: inside the OS sandbox, or on the host via host_bash. */
@@ -61,48 +60,6 @@ const KEEP_FINISHED = 20;
 
 export type BackgroundExit = { info: BackgroundTaskInfo; tail: string };
 
-/**
- * Whether a process other than a zombie is in process group `pgid`, from a
- * `/proc`-style directory. Undefined when it cannot be read.
- */
-export function groupHasLiveProcess(pgid: number, procDir = "/proc"): boolean | undefined {
-  let entries: string[];
-  try {
-    entries = readdirSync(procDir);
-  } catch {
-    return undefined;
-  }
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry)) continue;
-    let stat: string;
-    try {
-      stat = readFileSync(join(procDir, entry, "stat"), "utf8");
-    } catch {
-      continue; // Gone, or hidden from us.
-    }
-    // "pid (comm) state ppid pgrp ..."; comm may hold spaces and parentheses.
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    if (Number(fields[2]) === pgid && fields[0] !== "Z" && fields[0] !== "X") return true;
-  }
-  return false;
-}
-
-/**
- * Whether any process in the group led by `pid` still runs. On Linux, zombies
- * do not count: where PID 1 does not reap orphans, a finished worker can stay
- * a zombie in the group indefinitely.
- */
-function groupAlive(pid: number | undefined) {
-  if (!pid) return false;
-  try {
-    process.kill(-pid, 0);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
-  }
-  if (process.platform !== "linux") return true;
-  return groupHasLiveProcess(pid) ?? true;
-}
-
 /** Resolves once a stream has closed. */
 function drained(stream: Readable | null) {
   return new Promise<void>((resolve) => {
@@ -152,6 +109,8 @@ export class BackgroundTasks {
     private readonly onExit?: (exit: BackgroundExit) => void,
     /** Called whenever a task starts, starts stopping, or exits. */
     private readonly onChange?: () => void,
+    /** Sees zombies in a group whose leader exited (Linux); shared by every task. */
+    private readonly census: ProcessCensus | undefined = systemCensus,
   ) {}
 
   running(): number {
@@ -288,7 +247,8 @@ export class BackgroundTasks {
     // task running until the last process in the group is gone, so the group
     // stays listed, stoppable and killed on exit.
     const outlive = async () => {
-      while (info.state === "running" && groupAlive(child.pid)) {
+      const group = new GroupWatch(child.pid ?? 0, this.census);
+      while (info.state === "running" && !(await group.over())) {
         await new Promise((resolve) => setTimeout(resolve, GROUP_WATCH_MS));
       }
       if (info.state !== "running") return;
@@ -401,11 +361,13 @@ export class BackgroundTasks {
     const deadline = Date.now() + graceMs;
     let shellDone = false;
     void task.shellExited.then(() => (shellDone = true));
+    // A signal per poll, no /proc scan: a group left with only zombies waits
+    // out the grace period, then the task ends anyway.
     while (Date.now() < deadline) {
-      if (shellDone && !groupAlive(pid)) break;
+      if (shellDone && !groupExists(pid)) break;
       await new Promise((resolve) => setTimeout(resolve, GROUP_POLL_MS));
     }
-    if (!shellDone || groupAlive(pid)) {
+    if (!shellDone || groupExists(pid)) {
       killProcessGroup(task.child, "SIGKILL");
       await task.shellExited;
     }

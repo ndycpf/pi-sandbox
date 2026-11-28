@@ -22,7 +22,7 @@ import {
   mergeConfigLayers,
   resolveBackgroundBashConfig,
 } from "../src/config.ts";
-import { registerHostBash } from "../src/host-bash.ts";
+import { promptTitle, registerHostBash, titleRows } from "../src/host-bash.ts";
 import { initializeSandbox, spawnSandboxed } from "../src/sandbox-runtime.ts";
 
 const unix = ["linux", "darwin"].includes(process.platform);
@@ -290,7 +290,11 @@ test(
 
 function hostFixture(
   t: TestContext,
-  options: { allowBackground: boolean; select?: (title: string) => string },
+  options: {
+    allowBackground: boolean;
+    select?: (title: string) => string;
+    mode?: "tui" | "rpc";
+  },
 ) {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-bg-")));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
@@ -325,7 +329,7 @@ function hostFixture(
   const titles: string[] = [];
   const ctx = {
     cwd,
-    mode: "tui",
+    mode: options.mode ?? "tui",
     hasUI: true,
     sessionManager: { getSessionId: () => "fixture" },
     ui: {
@@ -355,8 +359,8 @@ test(
     const result = await run({ command: "echo up; exec sleep 30", background: true });
     assert.match(result.text, /Started host background task bg1/);
     assert.deepEqual(result.details, { taskId: "bg1", approvedBy: "operator" });
-    assert.match(titles[0]!, /IN THE BACKGROUND/);
-    assert.match(titles[0]!, /no time limit/);
+    assert.match(titles[0]!, /in BACKGROUND/);
+    assert.match(titles[0]!, /until stopped or Pi exits/);
     // Longer than hostBash.timeoutSeconds (1s): background runs are not limited.
     await new Promise((resolve) => setTimeout(resolve, 1300));
     assert.equal(tasks.get("bg1")?.kind, "host");
@@ -381,4 +385,27 @@ test("host_bash background needs approval and the global opt-in", { skip: !unix 
   const result = await off.run({ command: "echo fg", background: true });
   assert.match(result.text, /exit status: 0/);
   assert.equal(off.tasks.running(), 0);
+});
+
+test("host_bash background is approved through an RPC client", { skip: !unix }, async (t) => {
+  // RPC approval needs no TTY; hide it to be sure the RPC path is used.
+  const { tasks, titles, run } = hostFixture(t, { allowBackground: true, mode: "rpc" });
+  for (const stream of [process.stdin, process.stdout])
+    Object.defineProperty(stream, "isTTY", { configurable: true, value: false });
+  const result = await run({ command: "exec sleep 30", background: true });
+  assert.match(result.text, /Started host background task bg1/);
+  assert.match(titles[0]!, /in BACKGROUND/);
+  assert.equal(tasks.get("bg1")?.state, "running");
+  await tasks.stop("bg1", 200);
+});
+
+test("the background prompt leaves the command as many rows as a foreground one", () => {
+  for (const outputBytes of [0, 65536]) {
+    const options = { ...DEFAULT_HOST_BASH_CONFIG, timeoutSeconds: 3600, outputBytes };
+    const cwd = "/" + "d".repeat(40);
+    assert.equal(
+      titleRows(promptTitle("x", cwd, options, true)),
+      titleRows(promptTitle("x", cwd, options, false)),
+    );
+  }
 });

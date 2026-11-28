@@ -93,14 +93,21 @@ function outputPolicy(options: HostBashConfig) {
 }
 
 // The approval prompt's text. Throws if the operator could not read all of it.
-function promptTitle(command: string, cwd: string, options: HostBashConfig, background = false) {
+// Background headers take as many rows as foreground ones, so the command
+// gets the same budget in either mode.
+export function promptTitle(
+  command: string,
+  cwd: string,
+  options: HostBashConfig,
+  background = false,
+) {
   const output = outputPolicy(options);
   const header = [
     background
-      ? "Run IN THE BACKGROUND outside the OS sandbox? Host files and network are reachable."
+      ? "Run in BACKGROUND outside the OS sandbox? Host files and network reachable."
       : "Run outside the OS sandbox? Host files and network are reachable.",
     background
-      ? `${shell}, no time limit, runs until stopped or Pi exits, ${output}.`
+      ? `${shell}, until stopped or Pi exits, ${output}.`
       : `${shell}, limit ${options.timeoutSeconds}s, ${output}.`,
     "CWD: " + quoted(cwd),
   ];

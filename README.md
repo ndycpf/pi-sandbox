@@ -430,7 +430,9 @@ group (for example with `setsid` on macOS) is not stopped by `stop`.
 With `hostBash.allowBackground: true` in the **global** config, `host_bash`
 also takes `background: true`. The command is approved exactly like any other
 `host_bash` call (by you, or by auto-review when that is on), and the prompt
-says it will run in the background with no time limit. Once approved it runs
+says it will run in the background until stopped or Pi exits. It works in the
+same Pi modes as `host_bash` itself (`hostBash.approvalModes`: the TUI on a
+terminal, and RPC clients when `"rpc"` is listed). Once approved it runs
 outside the sandbox until it exits, is stopped with `bash_background stop`, or
 the session ends; `hostBash.timeoutSeconds` does not apply. The agent sees at
 most `hostBash.outputBytes` of its output. `backgroundBash.maxTasks` counts

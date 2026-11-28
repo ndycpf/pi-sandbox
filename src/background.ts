@@ -52,6 +52,13 @@ type Task = {
   visibleBytes: number;
   exited: Promise<void>;
   killTimer?: NodeJS.Timeout;
+  /** Called on new output and on exit, for `wait`. */
+  listeners: Set<() => void>;
+};
+
+export type WaitResult = {
+  info: BackgroundTaskInfo;
+  reason: "exited" | "matched" | "timeout" | "aborted";
 };
 
 /** How long a task gets after SIGTERM before its process group is killed. */
@@ -123,10 +130,12 @@ export class BackgroundTasks {
       state: "running",
       outputBytes: 0,
     };
+    const listeners = new Set<() => void>();
     for (const stream of [child.stdout, child.stderr]) {
       stream?.on("data", (chunk: Buffer) => {
         tail.push(chunk);
         info.outputBytes = tail.total;
+        for (const listener of listeners) listener();
       });
       stream?.on("error", () => {});
     }
@@ -153,6 +162,7 @@ export class BackgroundTasks {
         this.prune();
         this.updateExitHook();
         resolve();
+        for (const listener of listeners) listener();
         if (!stopped)
           this.onExit?.({ info: { ...info }, tail: tail.text(task?.visibleBytes ?? 0) });
       };
@@ -165,6 +175,7 @@ export class BackgroundTasks {
       tail,
       visibleBytes: Math.min(options.visibleBytes, tail.limit),
       exited,
+      listeners,
     });
     this.updateExitHook();
     return { ...info };
@@ -177,6 +188,44 @@ export class BackgroundTasks {
   get(id: string): BackgroundTaskInfo | undefined {
     const task = this.tasks.get(id);
     return task && { ...task.info };
+  }
+
+  /**
+   * Wait until the task exits, its new output matches `until`, the time runs
+   * out or `signal` aborts. The task keeps running unless it exited. Only
+   * output written after the wait starts can match. `onOutput` runs on each
+   * change, for streaming progress.
+   */
+  async wait(
+    id: string,
+    options: { timeoutMs: number; until?: RegExp; signal?: AbortSignal; onOutput?: () => void },
+  ): Promise<WaitResult | undefined> {
+    const task = this.tasks.get(id);
+    if (!task) return undefined;
+    if (task.info.state === "exited") return { info: { ...task.info }, reason: "exited" };
+    const from = task.tail.total;
+    return new Promise<WaitResult>((resolve) => {
+      let timer: NodeJS.Timeout | undefined;
+      const done = (reason: WaitResult["reason"]) => {
+        task.listeners.delete(check);
+        options.signal?.removeEventListener("abort", aborted);
+        if (timer) clearTimeout(timer);
+        resolve({ info: { ...task.info }, reason });
+      };
+      const check = () => {
+        if (task.info.state === "exited") return done("exited");
+        options.onOutput?.();
+        if (options.until) {
+          const fresh = Math.min(task.tail.total - from, task.tail.limit);
+          if (fresh > 0 && options.until.test(task.tail.text(fresh))) done("matched");
+        }
+      };
+      const aborted = () => done("aborted");
+      if (options.signal?.aborted) return aborted();
+      task.listeners.add(check);
+      options.signal?.addEventListener("abort", aborted, { once: true });
+      timer = setTimeout(() => done("timeout"), options.timeoutMs);
+    });
   }
 
   /** The visible tail of a task's combined output, or undefined for an unknown id. */
@@ -309,6 +358,8 @@ export function registerBackgroundTool(pi: ExtensionAPI, deps: BackgroundToolDep
       "Manage long-running Bash commands (dev servers, watchers, long builds) that run in the background. " +
       "`start` runs `command` in the same OS sandbox as ordinary bash and returns a task id at once; " +
       "`list` shows tasks, `logs` returns the tail of a task's combined stdout/stderr, `stop` terminates a task and its process group. " +
+      "`wait` watches a task, streaming its output, until it exits, its new output matches `until` (a regular expression), or `timeoutSeconds` pass; the task keeps running. " +
+      "`start` takes `until` and `timeoutSeconds` too, to wait for a server's ready line before returning. " +
       "Tasks are stopped when the Pi session ends or the sandbox is turned on or off. " +
       "Filesystem permissions are fixed when a task starts; network permissions granted later apply to it. " +
       (deps.hostBackground
@@ -318,6 +369,7 @@ export function registerBackgroundTool(pi: ExtensionAPI, deps: BackgroundToolDep
     promptSnippet: "Start, inspect and stop long-running background commands",
     promptGuidelines: [
       "For a command that keeps running (a dev server, a watcher), use bash_background start instead of `&` in bash, then check it with bash_background logs.",
+      "To wait for a server to be ready, pass `until` with a pattern from its ready line (and a `timeoutSeconds`) to bash_background start; to wait for a build or test run to finish, use bash_background wait.",
       "Stop background tasks you no longer need with bash_background stop.",
     ],
     parameters: Type.Object({
@@ -326,20 +378,80 @@ export function registerBackgroundTool(pi: ExtensionAPI, deps: BackgroundToolDep
         Type.Literal("list"),
         Type.Literal("logs"),
         Type.Literal("stop"),
+        Type.Literal("wait"),
       ]),
       command: Type.Optional(
         Type.String({ minLength: 1, maxLength: 16384, description: "Command for start" }),
       ),
-      id: Type.Optional(Type.String({ description: "Task id for logs and stop" })),
+      id: Type.Optional(Type.String({ description: "Task id for logs, stop and wait" })),
+      until: Type.Optional(
+        Type.String({
+          minLength: 1,
+          maxLength: 500,
+          description:
+            "For start and wait: stop waiting when new output matches this regular expression",
+        }),
+      ),
+      timeoutSeconds: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 600,
+          description:
+            "For start and wait: how long to wait (default 60 for wait; start waits only if until or this is given)",
+        }),
+      ),
       bytes: Type.Optional(
         Type.Integer({ minimum: 1, description: "For logs: how many bytes of the tail to return" }),
       ),
     }),
-    async execute(_id, params, _signal, _update, ctx) {
+    async execute(_id, params, signal, update, ctx) {
       const text = (body: string, details: unknown) => ({
         content: [{ type: "text" as const, text: body }],
         details,
       });
+      const show = (info: BackgroundTaskInfo) => {
+        const tail = tasks.logs(info.id)?.text;
+        return describeTask(info) + (tail ? `\n${tail}` : "");
+      };
+      let until: RegExp | undefined;
+      if (params.until !== undefined) {
+        try {
+          until = new RegExp(params.until, "m");
+        } catch (error) {
+          throw new Error(`until is not a valid regular expression: ${error}`);
+        }
+      }
+      // Streams the task's output into this tool call while it waits, so
+      // clients that show tool calls (the TUI, Orca's chat) show it live.
+      const watch = async (id: string, timeoutSeconds: number) => {
+        let last = 0;
+        let pending: NodeJS.Timeout | undefined;
+        const push = () => {
+          pending = undefined;
+          last = Date.now();
+          const info = tasks.get(id);
+          if (info) update?.(text(show(info), info));
+        };
+        const result = await tasks.wait(id, {
+          timeoutMs: timeoutSeconds * 1000,
+          until,
+          signal,
+          onOutput: () => {
+            if (pending) return;
+            pending = setTimeout(push, Math.max(0, 500 - (Date.now() - last)));
+          },
+        });
+        if (pending) clearTimeout(pending);
+        return result;
+      };
+      const waitNote = (result: WaitResult) =>
+        result.reason === "exited"
+          ? "The task has exited."
+          : result.reason === "matched"
+            ? `Its output matched ${JSON.stringify(params.until)}; it is still running.`
+            : result.reason === "timeout"
+              ? "Stopped waiting (timeoutSeconds); the task is still running."
+              : "Stopped waiting (cancelled); the task is still running.";
       const options = deps.config(ctx.cwd);
       if (params.action === "start") {
         if (!options.enabled) {
@@ -358,7 +470,15 @@ export function registerBackgroundTool(pi: ExtensionAPI, deps: BackgroundToolDep
           );
         }
         const info = await deps.start(params.command!, ctx);
-        return text(`Started ${describeTask(info)}`, info);
+        if (until === undefined && params.timeoutSeconds === undefined) {
+          return text(`Started ${describeTask(info)}`, info);
+        }
+        update?.(text(`Started ${describeTask(info)}`, info));
+        const result = (await watch(info.id, params.timeoutSeconds ?? 60))!;
+        return text(`Started ${show(result.info)}\n${waitNote(result)}`, {
+          ...result.info,
+          waited: result.reason,
+        });
       }
       if (params.action === "list") {
         const all = tasks.list();
@@ -374,6 +494,14 @@ export function registerBackgroundTool(pi: ExtensionAPI, deps: BackgroundToolDep
           result.text ||
           (result.info.outputBytes ? "(output hidden for this task)" : "(no output yet)");
         return text(`${describeTask(result.info)}\n${body}`, result.info);
+      }
+      if (params.action === "wait") {
+        const result = await watch(params.id, params.timeoutSeconds ?? 60);
+        if (!result) throw new Error(`Unknown background task: ${params.id}`);
+        return text(`${show(result.info)}\n${waitNote(result)}`, {
+          ...result.info,
+          waited: result.reason,
+        });
       }
       const stopped = await tasks.stop(params.id);
       if (!stopped) throw new Error(`Unknown background task: ${params.id}`);

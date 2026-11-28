@@ -415,6 +415,14 @@ after enabling it. The agent calls it with an `action`:
 - `list` shows the tasks, `logs` the tail of a task's combined stdout/stderr,
   and `stop` sends SIGTERM to the task's process group, then SIGKILL after 2
   seconds.
+- `wait` watches a task until it exits, its new output matches `until` (a
+  regular expression), or `timeoutSeconds` pass (default 60, at most 600). The
+  task keeps running. `start` takes the same `until` and `timeoutSeconds`, for
+  example to return once a dev server prints its ready line. While it waits,
+  the call streams the task's output as tool progress, so the TUI and RPC
+  clients that show tool calls (such as Orca's chat) show it live. This holds
+  the agent's turn, so it suits waiting for readiness or a build, not watching
+  a server for its whole life.
 
 While tasks run, the footer shows their count, such as `bg: 2 running (1 host)`,
 and a widget below the editor lists up to five of them, one line each

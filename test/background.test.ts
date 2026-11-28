@@ -432,3 +432,91 @@ test("the footer shows how many tasks run, and where", { skip: !unix }, async ()
   await tasks.stopAll(200);
   assert.equal(shown.at(-1), undefined);
 });
+
+test("wait returns on a match, an exit, a timeout or an abort", { skip: !unix }, async () => {
+  const tasks = new BackgroundTasks();
+  const server = tasks.add({
+    kind: "sandbox",
+    command: "",
+    cwd: tmpdir(),
+    child: sh("sleep 0.2; echo booting; sleep 0.2; echo listening on 3000; exec sleep 30"),
+    bufferBytes: 4096,
+    visibleBytes: 4096,
+  });
+  const matched = await tasks.wait(server.id, { timeoutMs: 5000, until: /listening on \d+/ });
+  assert.equal(matched?.reason, "matched");
+  assert.equal(matched?.info.state, "running");
+  const timedOut = await tasks.wait(server.id, { timeoutMs: 100 });
+  assert.equal(timedOut?.reason, "timeout");
+  const abort = new AbortController();
+  setTimeout(() => abort.abort(), 50);
+  assert.equal(
+    (await tasks.wait(server.id, { timeoutMs: 5000, signal: abort.signal }))?.reason,
+    "aborted",
+  );
+  assert.equal(tasks.get(server.id)?.state, "running");
+  const build = tasks.add({
+    kind: "sandbox",
+    command: "",
+    cwd: tmpdir(),
+    child: sh("sleep 0.2; exit 2"),
+    bufferBytes: 4096,
+    visibleBytes: 4096,
+  });
+  const exited = await tasks.wait(build.id, { timeoutMs: 5000 });
+  assert.equal(exited?.reason, "exited");
+  assert.equal(exited?.info.exitCode, 2);
+  assert.equal(await tasks.wait("bg99", { timeoutMs: 10 }), undefined);
+  await tasks.stopAll(200);
+});
+
+test(
+  "start with until streams output into the tool call until the task is ready",
+  { skip: !unix },
+  async () => {
+    const tasks = new BackgroundTasks();
+    let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
+    registerBackgroundTool(
+      { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,
+      {
+        tasks,
+        config: () => ({ ...DEFAULT_BACKGROUND_BASH_CONFIG, enabled: true }),
+        hostBackground: false,
+        start: async (command, ctx) =>
+          tasks.add({
+            kind: "sandbox",
+            command,
+            cwd: ctx.cwd,
+            child: sh(command, ctx.cwd),
+            bufferBytes: 4096,
+            visibleBytes: 4096,
+          }),
+      },
+    );
+    const updates: string[] = [];
+    const ctx = { cwd: tmpdir() } as unknown as ExtensionToolContext;
+    const result = await tool.execute(
+      "t",
+      {
+        action: "start",
+        command: "echo compiling; sleep 0.7; echo ready in 1s; exec sleep 30",
+        until: "ready in",
+        timeoutSeconds: 10,
+      },
+      undefined,
+      (partial: { content: { type: string; text?: string }[] }) =>
+        updates.push(partial.content[0]?.text ?? ""),
+      ctx,
+    );
+    const [content] = result.content;
+    const body = content?.type === "text" ? content.text : "";
+    assert.match(body, /ready in 1s/);
+    assert.match(body, /still running/);
+    assert.ok(updates.some((line) => line.includes("compiling")));
+    await assert.rejects(
+      tool.execute("t", { action: "wait", id: "bg1", until: "(" }, undefined, undefined, ctx),
+      /not a valid regular expression/,
+    );
+    await tasks.stopAll(200);
+  },
+);

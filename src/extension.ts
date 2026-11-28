@@ -14,8 +14,10 @@ import { Type } from "typebox";
 import {
   BACKGROUND_TOOL,
   BackgroundTasks,
+  describeTask,
   exitMessage,
   registerBackgroundTool,
+  statusText,
 } from "./background.ts";
 import {
   addDomainToConfig,
@@ -82,16 +84,27 @@ export default function (pi: ExtensionAPI) {
   const allowances: SessionAllowances = { domains: [], readPaths: [], writePaths: [] };
   // Long-running tasks belong to this session and this sandbox: they are
   // stopped on shutdown and whenever the sandbox is turned on or off.
-  const backgroundTasks = new BackgroundTasks((exit) => {
-    try {
-      pi.sendMessage(
-        { customType: "bash-background", content: exitMessage(exit), display: true },
-        { deliverAs: "steer" },
-      );
-    } catch {
-      // The session may be gone.
-    }
-  });
+  // The UI of the current session, for the footer count of running tasks.
+  let backgroundUi: { setStatus(key: string, text: string | undefined): void } | undefined;
+  const backgroundTasks = new BackgroundTasks(
+    (exit) => {
+      try {
+        pi.sendMessage(
+          { customType: "bash-background", content: exitMessage(exit), display: true },
+          { deliverAs: "steer" },
+        );
+      } catch {
+        // The session may be gone.
+      }
+    },
+    () => {
+      try {
+        backgroundUi?.setStatus("background", statusText(backgroundTasks.list()));
+      } catch {
+        // The session may be gone.
+      }
+    },
+  );
   let backgroundToolRegistered = false;
 
   const effectiveAllowances = (cwd: string) =>
@@ -359,6 +372,37 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  function registerBackgroundCommand() {
+    pi.registerCommand("background", {
+      description: "List background tasks, or stop one: /background stop <id|all>",
+      handler: async (args, ctx) => {
+        const [action = "list", target] = args.trim().split(/\s+/).filter(Boolean);
+        if (action === "list") {
+          const all = backgroundTasks.list();
+          ctx.ui.notify(
+            all.length ? all.map(describeTask).join("\n") : "No background tasks.",
+            "info",
+          );
+          return;
+        }
+        if (action === "stop" && target === "all") {
+          await backgroundTasks.stopAll();
+          ctx.ui.notify("Stopped all background tasks.", "info");
+          return;
+        }
+        if (action === "stop" && target) {
+          const stopped = await backgroundTasks.stop(target);
+          ctx.ui.notify(
+            stopped ? `Stopped: ${describeTask(stopped)}` : `Unknown background task: ${target}`,
+            stopped ? "info" : "error",
+          );
+          return;
+        }
+        ctx.ui.notify("Usage: /background [list] | /background stop <id|all>", "error");
+      },
+    });
+  }
+
   async function startBackground(command: string, ctx: Parameters<typeof showPermissionPrompt>[1]) {
     const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted });
     const prefix = settings.getShellCommandPrefix();
@@ -578,8 +622,10 @@ export default function (pi: ExtensionAPI) {
     const startupConfig = loadConfig(ctx.cwd, projectTrusted);
     const hostBackground =
       startupConfig.hostBash?.enabled === true && startupConfig.hostBash.allowBackground === true;
+    backgroundUi = ctx.ui;
     if (!backgroundToolRegistered && (startupConfig.backgroundBash?.enabled || hostBackground)) {
       backgroundToolRegistered = true;
+      registerBackgroundCommand();
       registerBackgroundTool(pi, {
         tasks: backgroundTasks,
         config: (cwd) =>
@@ -606,6 +652,7 @@ export default function (pi: ExtensionAPI) {
     hostBash?.stop();
     cancelPermissionPrompts(pi);
     await backgroundTasks.stopAll();
+    backgroundUi = undefined;
     if (!sandboxInitialized) return;
     try {
       await reviewSandbox.reset();

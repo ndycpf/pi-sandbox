@@ -14,6 +14,7 @@ import {
   BackgroundTasks,
   OutputTail,
   registerBackgroundTool,
+  statusText,
 } from "../src/background.ts";
 import {
   DEFAULT_BACKGROUND_BASH_CONFIG,
@@ -408,4 +409,26 @@ test("the background prompt leaves the command as many rows as a foreground one"
       titleRows(promptTitle("x", cwd, options, false)),
     );
   }
+});
+
+test("the footer shows how many tasks run, and where", { skip: !unix }, async () => {
+  const shown: (string | undefined)[] = [];
+  const tasks: BackgroundTasks = new BackgroundTasks(undefined, () =>
+    shown.push(statusText(tasks.list())),
+  );
+  assert.equal(statusText([]), undefined);
+  const add = (kind: "sandbox" | "host") =>
+    tasks.add({
+      kind,
+      command: "sleep 30",
+      cwd: tmpdir(),
+      child: sh("sleep 30"),
+      bufferBytes: 1024,
+      visibleBytes: 0,
+    });
+  add("sandbox");
+  add("host");
+  assert.equal(shown.at(-1), "bg: 2 running (1 host)");
+  await tasks.stopAll(200);
+  assert.equal(shown.at(-1), undefined);
 });

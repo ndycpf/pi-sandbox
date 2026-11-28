@@ -416,6 +416,11 @@ after enabling it. The agent calls it with an `action`:
   and `stop` sends SIGTERM to the task's process group, then SIGKILL after 2
   seconds.
 
+While tasks run, the footer shows their count, such as `bg: 2 running (1 host)`.
+`/background` lists the tasks and `/background stop <id|all>` stops them; both
+work in the TUI and in RPC clients (the result is sent as a notification, and
+the footer text as a status update the client may show).
+
 When a task exits on its own, its status and output tail are added to the
 conversation. Every task is stopped when the session ends (including `/new`
 and Pi exiting) and whenever the sandbox is turned on or off, so a task never

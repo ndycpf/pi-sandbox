@@ -85,7 +85,11 @@ export class BackgroundTasks {
   private next = 1;
   private exitHook?: () => void;
 
-  constructor(private readonly onExit?: (exit: BackgroundExit) => void) {}
+  constructor(
+    private readonly onExit?: (exit: BackgroundExit) => void,
+    /** Called whenever a task starts, starts stopping, or exits. */
+    private readonly onChange?: () => void,
+  ) {}
 
   running(): number {
     let count = 0;
@@ -189,6 +193,7 @@ export class BackgroundTasks {
     if (!task) return undefined;
     if (task.info.state === "running") {
       task.info.state = "stopping";
+      this.onChange?.();
       killGroup(task.child, "SIGTERM");
       task.killTimer = setTimeout(() => killGroup(task.child, "SIGKILL"), graceMs);
     }
@@ -210,6 +215,7 @@ export class BackgroundTasks {
 
   // If Pi exits without a session_shutdown, do not leave tasks behind.
   private updateExitHook() {
+    this.onChange?.();
     const live = this.running() > 0;
     if (live && !this.exitHook) {
       this.exitHook = () => {
@@ -224,7 +230,7 @@ export class BackgroundTasks {
   }
 }
 
-function describe(info: BackgroundTaskInfo) {
+export function describeTask(info: BackgroundTaskInfo) {
   const where =
     info.kind === "sandbox"
       ? "in the sandbox"
@@ -238,9 +244,21 @@ function describe(info: BackgroundTaskInfo) {
   return `${info.id} [${status}] ${where}, pid ${info.pid ?? "?"}, ${info.outputBytes} bytes of output: ${JSON.stringify(info.command)}`;
 }
 
+/** Footer text for the running tasks, or undefined when none are running. */
+export function statusText(tasks: BackgroundTaskInfo[]): string | undefined {
+  const live = tasks.filter((task) => task.state !== "exited");
+  if (!live.length) return undefined;
+  const host = live.filter((task) => task.kind === "host").length;
+  const unsandboxed = live.filter((task) => task.kind === "unsandboxed").length;
+  const extra = [host && `${host} host`, unsandboxed && `${unsandboxed} unsandboxed`].filter(
+    Boolean,
+  );
+  return `bg: ${live.length} running` + (extra.length ? ` (${extra.join(", ")})` : "");
+}
+
 export function exitMessage({ info, tail }: BackgroundExit) {
   return (
-    `Background task ${describe(info)}` +
+    `Background task ${describeTask(info)}` +
     (tail ? `\nLast output (stdout and stderr interleaved):\n${tail}` : "")
   );
 }
@@ -314,11 +332,11 @@ export function registerBackgroundTool(pi: ExtensionAPI, deps: BackgroundToolDep
           );
         }
         const info = await deps.start(params.command!, ctx);
-        return text(`Started ${describe(info)}`, info);
+        return text(`Started ${describeTask(info)}`, info);
       }
       if (params.action === "list") {
         const all = tasks.list();
-        return text(all.length ? all.map(describe).join("\n") : "No background tasks.", {
+        return text(all.length ? all.map(describeTask).join("\n") : "No background tasks.", {
           tasks: all,
         });
       }
@@ -329,11 +347,11 @@ export function registerBackgroundTool(pi: ExtensionAPI, deps: BackgroundToolDep
         const body =
           result.text ||
           (result.info.outputBytes ? "(output hidden for this task)" : "(no output yet)");
-        return text(`${describe(result.info)}\n${body}`, result.info);
+        return text(`${describeTask(result.info)}\n${body}`, result.info);
       }
       const stopped = await tasks.stop(params.id);
       if (!stopped) throw new Error(`Unknown background task: ${params.id}`);
-      return text(`Stopped: ${describe(stopped)}`, stopped);
+      return text(`Stopped: ${describeTask(stopped)}`, stopped);
     },
   });
 }

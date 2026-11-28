@@ -151,6 +151,50 @@ test(
   },
 );
 
+test(
+  "a task whose launcher exits keeps running while its process group does",
+  { skip: !unix },
+  async () => {
+    const exits: BackgroundExit[] = [];
+    const tasks = new BackgroundTasks((exit) => exits.push(exit));
+    // The launcher exits at once with status 0; its worker stays in the group.
+    const info = tasks.add({
+      kind: "host",
+      command: "",
+      cwd: tmpdir(),
+      child: sh("sleep 30 & echo worker=$!"),
+      bufferBytes: 1024,
+      visibleBytes: 1024,
+    });
+    await until(() => /worker=\d+/.test(tasks.logs(info.id)!.text));
+    const workerPid = Number(/worker=(\d+)/.exec(tasks.logs(info.id)!.text)![1]);
+    await until(() => tasks.get(info.id)?.exitCode === 0);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(tasks.get(info.id)?.state, "running");
+    assert.equal(tasks.running(), 1);
+    assert.ok(alive(workerPid));
+    const stopped = await tasks.stop(info.id, 200);
+    assert.equal(stopped?.state, "exited");
+    await until(() => !alive(workerPid));
+    assert.equal(exits.length, 0);
+
+    // Once the rest of the group exits by itself, the task exits and is reported.
+    const short = tasks.add({
+      kind: "host",
+      command: "",
+      cwd: tmpdir(),
+      child: sh("sleep 0.5 >/dev/null 2>&1 & echo launched"),
+      bufferBytes: 1024,
+      visibleBytes: 1024,
+    });
+    await until(() => tasks.get(short.id)?.exitCode === 0);
+    assert.equal(tasks.get(short.id)?.state, "running");
+    await until(() => tasks.get(short.id)?.state === "exited");
+    assert.equal(exits.length, 1);
+    assert.equal(exits[0]!.info.id, short.id);
+  },
+);
+
 test("stopAll stops every running task", { skip: !unix }, async () => {
   const tasks = new BackgroundTasks();
   const ids = [1, 2].map(

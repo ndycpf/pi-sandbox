@@ -444,7 +444,9 @@ Orca and pi-web ask before stopping an idle Pi; without it, Orca's idle stop
 (30 minutes by default) would end the session and its tasks.
 
 When a task exits on its own, its status and output tail are added to the
-conversation. Every task is stopped when the session ends (including `/new`
+conversation. A task is over when every process in its process group is: a
+command such as `server & echo started` stays running (and stoppable) after
+its shell exits, until the server does too. Every task is stopped when the session ends (including `/new`
 and Pi exiting) and whenever the sandbox is turned on or off, so a task never
 outlives the sandbox it started in. Filesystem rules are fixed when a task
 starts; domains granted later apply to it, since the network proxy is shared.
@@ -546,8 +548,9 @@ entries are used, so an explicit empty array disables that default.
 While the sandbox is being turned on or off (at session start, with Alt+S or
 `/sandbox-enable`/`/sandbox-disable`), a `bash` call or `!` command waits for
 the change to finish and then runs with the state it set, so a command started
-during initialization never runs unsandboxed. Background starts are refused
-during the change instead.
+during initialization never runs unsandboxed. If turning the sandbox on fails,
+the commands that waited for it are refused with the error and nothing runs.
+Background starts are refused during the change instead.
 
 The footer shows a lock indicator while the sandbox is active.
 

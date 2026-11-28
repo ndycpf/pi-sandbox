@@ -49,6 +49,8 @@ export type WaitResult = {
 export const STOP_GRACE_MS = 2000;
 /** How often a stop checks whether the process group is gone. */
 const GROUP_POLL_MS = 25;
+/** How often a task whose shell exited checks whether the rest of its group is gone. */
+const GROUP_WATCH_MS = 250;
 /** Finished tasks kept for `logs` and `list`. */
 const KEEP_FINISHED = 20;
 
@@ -232,7 +234,16 @@ export class BackgroundTasks {
       info.signal = signal;
       resolveShell();
       // A stop finalizes once the rest of the process group is gone too.
-      if (info.state !== "stopping") finalize();
+      if (info.state !== "stopping") void outlive();
+    };
+    // A launcher that exits while its group runs on (`server &`) leaves the
+    // task running until the last process in the group is gone, so the group
+    // stays listed, stoppable and killed on exit.
+    const outlive = async () => {
+      while (info.state === "running" && groupAlive(child.pid)) {
+        await new Promise((resolve) => setTimeout(resolve, GROUP_WATCH_MS));
+      }
+      if (info.state === "running") finalize();
     };
     child.once("exit", shellExit);
     child.once("error", () => shellExit(null, null));

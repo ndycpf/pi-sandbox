@@ -87,9 +87,23 @@ export default function (pi: ExtensionAPI) {
   // whether to wrap its command, so it never runs unsandboxed while the
   // sandbox is being turned on.
   const sandboxChange = new SettleGate();
-  const changeSandbox = <T>(change: () => Promise<T>): Promise<T> => {
+  // Turning the sandbox on reports a failed initialization to the commands
+  // that waited for it, so they are refused instead of running on the host.
+  let lastInitError = "unknown error";
+  const changeSandbox = async (
+    kind: "enable" | "disable",
+    change: () => Promise<boolean>,
+  ): Promise<boolean> => {
     const leave = sandboxChange.enter();
-    return background.whileStopped(change).finally(leave);
+    let ok = false;
+    try {
+      ok = await background.whileStopped(change);
+      return ok;
+    } finally {
+      leave(
+        kind === "enable" && !ok ? `the sandbox failed to start (${lastInitError})` : undefined,
+      );
+    }
   };
   const background = createBackgroundSession(pi, {
     config: backgroundConfig,
@@ -165,7 +179,7 @@ export default function (pi: ExtensionAPI) {
     hostBash?.start(ctx);
     // Tasks started while the sandbox was off must not keep running
     // unsandboxed, and none may start until it is on.
-    return changeSandbox(async () => {
+    return changeSandbox("enable", async () => {
       try {
         await initializeSandbox(sandboxManager, config, allowances, ctx.cwd);
         if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
@@ -180,6 +194,7 @@ export default function (pi: ExtensionAPI) {
         return true;
       } catch (error) {
         sandboxEnabled = false;
+        lastInitError = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(
           `Sandbox initialization failed: ${error instanceof Error ? error.message : error}`,
           "error",
@@ -200,7 +215,7 @@ export default function (pi: ExtensionAPI) {
     hostBash?.stop();
     cancelPermissionPrompts(pi);
     // No task may start while the sandbox is torn down.
-    return changeSandbox(async () => {
+    return changeSandbox("disable", async () => {
       if (sandboxInitialized) {
         try {
           await reviewSandbox.reset();
@@ -393,7 +408,12 @@ export default function (pi: ExtensionAPI) {
     ...localBash,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
-      await sandboxChange.settled();
+      const failure = await sandboxChange.settled();
+      if (failure) {
+        throw new Error(
+          `Command not run: ${failure} while it waited to start. Nothing was executed.`,
+        );
+      }
       const runBash = () => {
         const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted });
         const userShellPath = settings.getShellPath();
@@ -431,7 +451,17 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("user_bash", async (event, ctx) => {
-    await sandboxChange.settled();
+    const failure = await sandboxChange.settled();
+    if (failure) {
+      return {
+        result: {
+          output: `Command not run: ${failure} while it waited to start.`,
+          exitCode: 1,
+          cancelled: false,
+          truncated: false,
+        },
+      };
+    }
     if (!sandboxEnabled || !sandboxInitialized) return;
 
     const userShellPath = SettingsManager.create(ctx.cwd, undefined, {

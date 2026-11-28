@@ -1,4 +1,7 @@
 import type { ChildProcess } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { Readable } from "node:stream";
 
 import { OutputTail } from "./output-tail.ts";
 import { killProcessGroup } from "./process-group.ts";
@@ -51,20 +54,61 @@ export const STOP_GRACE_MS = 2000;
 const GROUP_POLL_MS = 25;
 /** How often a task whose shell exited checks whether the rest of its group is gone. */
 const GROUP_WATCH_MS = 250;
+/** How long a finished task's output gets to drain. */
+const DRAIN_MS = 200;
 /** Finished tasks kept for `logs` and `list`. */
 const KEEP_FINISHED = 20;
 
 export type BackgroundExit = { info: BackgroundTaskInfo; tail: string };
 
-/** Whether any process in the group led by `pid` still exists. */
+/**
+ * Whether a process other than a zombie is in process group `pgid`, from a
+ * `/proc`-style directory. Undefined when it cannot be read.
+ */
+export function groupHasLiveProcess(pgid: number, procDir = "/proc"): boolean | undefined {
+  let entries: string[];
+  try {
+    entries = readdirSync(procDir);
+  } catch {
+    return undefined;
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    let stat: string;
+    try {
+      stat = readFileSync(join(procDir, entry, "stat"), "utf8");
+    } catch {
+      continue; // Gone, or hidden from us.
+    }
+    // "pid (comm) state ppid pgrp ..."; comm may hold spaces and parentheses.
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (Number(fields[2]) === pgid && fields[0] !== "Z" && fields[0] !== "X") return true;
+  }
+  return false;
+}
+
+/**
+ * Whether any process in the group led by `pid` still runs. On Linux, zombies
+ * do not count: where PID 1 does not reap orphans, a finished worker can stay
+ * a zombie in the group indefinitely.
+ */
 function groupAlive(pid: number | undefined) {
   if (!pid) return false;
   try {
     process.kill(-pid, 0);
-    return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
   }
+  if (process.platform !== "linux") return true;
+  return groupHasLiveProcess(pid) ?? true;
+}
+
+/** Resolves once a stream has closed. */
+function drained(stream: Readable | null) {
+  return new Promise<void>((resolve) => {
+    if (!stream || stream.destroyed || stream.closed) return resolve();
+    stream.once("close", () => resolve());
+  });
 }
 
 /**
@@ -159,6 +203,8 @@ export class BackgroundTasks {
     visibleBytes: number;
     cleanup?: () => void;
     reservation?: Reservation;
+    /** Output read before the hand-over (Node drops unread output when a child exits). */
+    output?: Buffer[];
   }): BackgroundTaskInfo {
     const { child } = options;
     options.reservation?.release();
@@ -195,6 +241,8 @@ export class BackgroundTasks {
       outputBytes: 0,
     };
     const listeners = new Set<() => void>();
+    for (const chunk of options.output ?? []) tail.push(chunk);
+    info.outputBytes = tail.total;
     for (const stream of [child.stdout, child.stderr]) {
       stream?.on("data", (chunk: Buffer) => {
         tail.push(chunk);
@@ -243,10 +291,22 @@ export class BackgroundTasks {
       while (info.state === "running" && groupAlive(child.pid)) {
         await new Promise((resolve) => setTimeout(resolve, GROUP_WATCH_MS));
       }
+      if (info.state !== "running") return;
+      // Read what the group wrote before it ended; a descendant that left the
+      // group may hold the pipes open, so only for a moment.
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        Promise.all([child.stdout, child.stderr].map(drained)),
+        new Promise((resolve) => (timer = setTimeout(resolve, DRAIN_MS))),
+      ]);
+      clearTimeout(timer);
       if (info.state === "running") finalize();
     };
     child.once("exit", shellExit);
     child.once("error", () => shellExit(null, null));
+    // A short command may have exited before it was handed over.
+    if (child.exitCode !== null || child.signalCode !== null)
+      queueMicrotask(() => shellExit(child.exitCode, child.signalCode));
     const task: Task = {
       info,
       child,

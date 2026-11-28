@@ -178,25 +178,39 @@ function format(code: number | null, tail: OutputTail | undefined, path: string)
   return status + outputText(tail);
 }
 
+/** How long a launcher that already exited gets for its fd 3 report to arrive. */
+const REPORT_GRACE_MS = 1000;
+
 /**
  * For a background run: resolve once the launcher has confirmed the approved
- * directory, so the process can be handed to the task registry. Kills the
- * process group and refuses if the check fails, the process ends first, or
- * the call is cancelled before that.
+ * directory, so the process can be handed to the task registry. The report
+ * decides: a command that finishes before it is read was still started, and
+ * its exit status becomes the task's. Kills the process group and refuses if
+ * the check fails or the call is cancelled before that.
  */
-async function launchedInApprovedDirectory(
+export async function launchedInApprovedDirectory(
   child: ChildProcess,
   verified: Promise<boolean>,
   lifetime: AbortSignal,
 ) {
-  const ended = new Promise<false>((done) => {
-    child.once("exit", () => done(false));
-    child.once("error", () => done(false));
+  const ended = new Promise<"ended">((done) => {
+    child.once("exit", () => done("ended"));
+    child.once("error", () => done("ended"));
   });
   const stop = () => killProcessGroup(child);
   lifetime.addEventListener("abort", stop, { once: true });
   try {
-    if (!(await Promise.race([verified, ended])) || lifetime.aborted) {
+    let ok = await Promise.race([verified, ended]);
+    if (ok === "ended") {
+      // Exit and the pipe's close arrive in either order.
+      let timer: NodeJS.Timeout | undefined;
+      ok = await Promise.race([
+        verified,
+        new Promise<false>((done) => (timer = setTimeout(() => done(false), REPORT_GRACE_MS))),
+      ]);
+      clearTimeout(timer);
+    }
+    if (!ok || lifetime.aborted) {
       stop();
       throw new ApprovalRefused(
         "Host command refused: the working directory changed before execution, or the call was cancelled.",
@@ -491,12 +505,19 @@ export function registerHostBash(
           child.once("spawn", () => {
             started = true;
           });
+          // Read from the start: a command that ends before the hand-over
+          // would otherwise lose its output.
+          const early: Buffer[] = [];
+          const collect = (chunk: Buffer) => early.push(chunk);
+          for (const stream of [child.stdout, child.stderr]) stream?.on("data", collect);
           try {
             await launchedInApprovedDirectory(child, verified, lifetime);
           } finally {
             report?.destroy();
           }
+          for (const stream of [child.stdout, child.stderr]) stream?.off("data", collect);
           const info = background.tasks.add({
+            output: early,
             kind: "host",
             command,
             cwd,

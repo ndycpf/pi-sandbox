@@ -1,7 +1,8 @@
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 
-import { spawn } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -12,6 +13,7 @@ import assert from "node:assert/strict";
 import {
   type BackgroundExit,
   BackgroundTasks,
+  groupHasLiveProcess,
   Reservation,
   StaleStartError,
 } from "../src/background-tasks.ts";
@@ -23,7 +25,12 @@ import {
   mergeConfigLayers,
   resolveBackgroundBashConfig,
 } from "../src/config.ts";
-import { promptTitle, registerHostBash, titleRows } from "../src/host-bash.ts";
+import {
+  launchedInApprovedDirectory,
+  promptTitle,
+  registerHostBash,
+  titleRows,
+} from "../src/host-bash.ts";
 import { OutputTail } from "../src/output-tail.ts";
 import { initializeSandbox, spawnSandboxed } from "../src/sandbox-runtime.ts";
 
@@ -422,6 +429,134 @@ test(
       /background tasks are already running/,
     );
     await tasks.stop("bg1", 200);
+  },
+);
+
+test("a background launcher that exits before its report is still started", async () => {
+  // Exit arrives first, then the report: the start counts and nothing is killed.
+  const child = Object.assign(new EventEmitter(), { pid: undefined }) as unknown as ChildProcess;
+  let report!: (ok: boolean) => void;
+  const verified = new Promise<boolean>((done) => (report = done));
+  const launched = launchedInApprovedDirectory(child, verified, new AbortController().signal);
+  child.emit("exit", 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  report(true);
+  await launched;
+
+  // A failed report after an exit still refuses.
+  const failed = Object.assign(new EventEmitter(), { pid: undefined }) as unknown as ChildProcess;
+  const refused = launchedInApprovedDirectory(
+    failed,
+    Promise.resolve(false),
+    new AbortController().signal,
+  );
+  failed.emit("exit", 125, null);
+  await assert.rejects(refused, /refused/);
+});
+
+test(
+  "short host_bash background commands start and report their exit",
+  { skip: !unix, timeout: 30_000 },
+  async (t) => {
+    const { tasks, run } = hostFixture(t, { allowBackground: true });
+    for (let i = 0; i < 20; i++) {
+      const result = await run({ command: `echo done${i}`, background: true });
+      assert.match(result.text, /Started host background task/, `run ${i}`);
+      const id = (result.details as { taskId: string }).taskId;
+      await until(() => tasks.get(id)?.state === "exited");
+      assert.equal(tasks.get(id)?.exitCode, 0);
+      assert.match(tasks.logs(id)!.text, new RegExp(`done${i}`));
+    }
+  },
+);
+
+test("tasks.add takes a child that already exited", { skip: !unix }, async () => {
+  const exits: BackgroundExit[] = [];
+  const tasks = new BackgroundTasks((exit) => exits.push(exit));
+  const child = sh("echo early; exit 3");
+  const output: Buffer[] = [];
+  child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
+  await new Promise((resolve) => child.once("close", resolve));
+  const info = tasks.add({
+    kind: "host",
+    command: "",
+    cwd: tmpdir(),
+    child,
+    output,
+    bufferBytes: 1024,
+    visibleBytes: 1024,
+  });
+  await until(() => tasks.get(info.id)?.state === "exited");
+  assert.equal(tasks.get(info.id)?.exitCode, 3);
+  assert.equal(exits.length, 1);
+  assert.match(exits[0]!.tail, /early/);
+});
+
+test("a process group holding only zombies counts as gone", () => {
+  const proc = mkdtempSync(join(tmpdir(), "pi-proc-"));
+  try {
+    const stat = (pid: number, comm: string, state: string, pgrp: number) => {
+      mkdirSync(join(proc, String(pid)));
+      writeFileSync(
+        join(proc, String(pid), "stat"),
+        `${pid} (${comm}) ${state} 1 ${pgrp} ${pgrp} 0 -1\n`,
+      );
+    };
+    stat(100, "worker", "Z", 100);
+    stat(101, "odd ) name", "Z", 100);
+    stat(200, "other", "S", 200);
+    mkdirSync(join(proc, "self"));
+    assert.equal(groupHasLiveProcess(100, proc), false);
+    assert.equal(groupHasLiveProcess(200, proc), true);
+    stat(102, "x) S 1 100 (y", "R", 100);
+    assert.equal(groupHasLiveProcess(100, proc), true);
+    assert.equal(groupHasLiveProcess(100, join(proc, "missing")), undefined);
+  } finally {
+    rmSync(proc, { recursive: true, force: true });
+  }
+});
+
+test(
+  "a task ends when only unreaped zombies are left in its group",
+  { skip: process.platform !== "linux" || spawnSync("python3", ["-V"]).status !== 0 },
+  async (t) => {
+    const exits: BackgroundExit[] = [];
+    const tasks = new BackgroundTasks((exit) => exits.push(exit));
+    t.after(() => tasks.stopAll(200));
+    // A parent that never reaps moves itself to another group, leaving its
+    // exited child behind as a zombie in the task's group, as an orphan does
+    // under a PID 1 that does not reap.
+    const script = [
+      "import os, sys, time",
+      "pid = os.fork()",
+      "if pid == 0: os._exit(0)",
+      "os.setpgid(0, 0)",
+      "print(f'parent={os.getpid()} zombie={pid}', flush=True)",
+      "sys.stdout.close(); sys.stderr.close()",
+      "time.sleep(30)",
+    ].join("\n");
+    const info = tasks.add({
+      kind: "host",
+      command: "",
+      cwd: tmpdir(),
+      child: sh(`python3 -c "${script}" & wait`),
+      bufferBytes: 1024,
+      visibleBytes: 1024,
+    });
+    await until(() => /parent=\d+/.test(tasks.logs(info.id)!.text));
+    const parent = Number(/parent=(\d+)/.exec(tasks.logs(info.id)!.text)![1]);
+    t.after(() => {
+      try {
+        process.kill(parent, "SIGKILL");
+      } catch {}
+    });
+    const zombie = Number(/zombie=(\d+)/.exec(tasks.logs(info.id)!.text)![1]);
+    // The shell waits only for python3's original pid, which is the parent.
+    // Kill the shell so only the zombie stays in the group.
+    process.kill(info.pid!, "SIGKILL");
+    await until(() => tasks.get(info.id)?.state === "exited", 5000);
+    assert.ok(alive(zombie), "the zombie is still there");
+    assert.equal(exits.length, 1);
   },
 );
 

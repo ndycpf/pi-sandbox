@@ -446,7 +446,8 @@ Orca and pi-web ask before stopping an idle Pi; without it, Orca's idle stop
 When a task exits on its own, its status and output tail are added to the
 conversation. A task is over when every process in its process group is: a
 command such as `server & echo started` stays running (and stoppable) after
-its shell exits, until the server does too. Every task is stopped when the session ends (including `/new`
+its shell exits, until the server does too. On Linux, zombies left in the
+group (where PID 1 does not reap orphans) do not keep a task running. Every task is stopped when the session ends (including `/new`
 and Pi exiting) and whenever the sandbox is turned on or off, so a task never
 outlives the sandbox it started in. Filesystem rules are fixed when a task
 starts; domains granted later apply to it, since the network proxy is shared.

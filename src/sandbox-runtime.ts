@@ -15,6 +15,7 @@ import type { ReviewExec } from "./host-review-tools.ts";
 
 import { type SandboxConfig } from "./config.ts";
 import { canonicalizePath } from "./policy.ts";
+import { killProcessGroup as killChildGroup } from "./process-group.ts";
 
 export interface SessionAllowances {
   domains: string[];
@@ -328,14 +329,7 @@ export function createSandboxedBashOps(
       let timedOut = false;
       let timeoutHandle: NodeJS.Timeout | undefined;
 
-      const killProcessGroup = () => {
-        if (!child.pid) return;
-        try {
-          process.kill(-child.pid, "SIGKILL");
-        } catch {
-          child.kill("SIGKILL");
-        }
-      };
+      const killProcessGroup = () => killChildGroup(child);
 
       if (timeout !== undefined && timeout > 0) {
         timeoutHandle = setTimeout(() => {

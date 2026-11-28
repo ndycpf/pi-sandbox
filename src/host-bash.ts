@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { closeSync, constants, fstatSync, openSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
 
@@ -10,7 +10,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import type { BackgroundTasks } from "./background.ts";
+import type { BackgroundTasks } from "./background-tasks.ts";
 import type { ReviewExec } from "./host-review-tools.ts";
 
 import {
@@ -28,6 +28,8 @@ import {
   reviewCommand,
   transcriptRecords,
 } from "./host-review.ts";
+import { OutputTail } from "./output-tail.ts";
+import { killProcessGroup } from "./process-group.ts";
 
 const shell = "/bin/bash";
 const refusal = "Host command refused.";
@@ -153,33 +155,10 @@ export function hostPath() {
   return process.env.PATH || fallbackPath;
 }
 
-// Keeps the last `limit` bytes written to it.
-class Tail {
-  private chunks: Buffer[] = [];
-  private kept = 0;
-  total = 0;
-  constructor(private readonly limit: number) {}
-  get limitBytes() {
-    return this.limit;
-  }
-  push(chunk: Buffer) {
-    this.total += chunk.length;
-    this.chunks.push(chunk);
-    this.kept += chunk.length;
-    while (this.chunks.length > 1 && this.kept - this.chunks[0]!.length >= this.limit) {
-      this.kept -= this.chunks.shift()!.length;
-    }
-  }
-  text() {
-    const all = Buffer.concat(this.chunks);
-    return new TextDecoder("utf-8").decode(all.subarray(Math.max(0, all.length - this.limit)));
-  }
-}
-
-function outputText(tail: Tail | undefined) {
+function outputText(tail: OutputTail | undefined) {
   if (!tail) return "";
   if (!tail.total) return "\nNo output.";
-  const shown = Math.min(tail.total, tail.limitBytes);
+  const shown = Math.min(tail.total, tail.limit);
   const header =
     shown < tail.total
       ? `Output (last ${shown} of ${tail.total} bytes, stdout and stderr interleaved):`
@@ -187,7 +166,7 @@ function outputText(tail: Tail | undefined) {
   return "\n" + header + "\n" + tail.text();
 }
 
-function format(code: number | null, tail: Tail | undefined, path: string) {
+function format(code: number | null, tail: OutputTail | undefined, path: string) {
   let status = "Host Bash exit status: " + (code ?? "terminated by signal");
   // With outputBytes 0 the agent sees the exit status only, so no host details.
   if (code === 127 && tail) {
@@ -197,6 +176,35 @@ function format(code: number | null, tail: Tail | undefined, path: string) {
       "Do not retry the same command.";
   }
   return status + outputText(tail);
+}
+
+/**
+ * For a background run: resolve once the launcher has confirmed the approved
+ * directory, so the process can be handed to the task registry. Kills the
+ * process group and refuses if the check fails, the process ends first, or
+ * the call is cancelled before that.
+ */
+async function launchedInApprovedDirectory(
+  child: ChildProcess,
+  verified: Promise<boolean>,
+  lifetime: AbortSignal,
+) {
+  const ended = new Promise<false>((done) => {
+    child.once("exit", () => done(false));
+    child.once("error", () => done(false));
+  });
+  const stop = () => killProcessGroup(child);
+  lifetime.addEventListener("abort", stop, { once: true });
+  try {
+    if (!(await Promise.race([verified, ended])) || lifetime.aborted) {
+      stop();
+      throw new ApprovalRefused(
+        "Host command refused: the working directory changed before execution, or the call was cancelled.",
+      );
+    }
+  } finally {
+    lifetime.removeEventListener("abort", stop);
+  }
 }
 
 export type HostBashDeps = {
@@ -445,7 +453,7 @@ export function registerHostBash(
         // argv element, never interpolated into the launcher.
         const identity = `${dir.dev}:${dir.ino}`;
         const guard = `[[ "$(${statCommand} .)" == "$2" ]] || exit 125; printf ok >&3; exec 3>&-; exec /bin/bash --noprofile --norc -c "$1"`;
-        const tail = options.outputBytes ? new Tail(options.outputBytes) : undefined;
+        const tail = options.outputBytes ? new OutputTail(options.outputBytes) : undefined;
         const env: Record<string, string> = { PATH: path };
         if (process.env.HOME) env.HOME = process.env.HOME;
         const child = spawn(
@@ -467,30 +475,12 @@ export function registerHostBash(
           report.once("error", () => done(false));
         });
         if (inBackground) {
-          const exited = new Promise<false>((done) => child.once("exit", () => done(false)));
-          const failed = new Promise<false>((done) => child.once("error", () => done(false)));
           child.once("spawn", () => {
             started = true;
           });
-          const stopEarly = () => {
-            if (child.pid) {
-              try {
-                process.kill(-child.pid, "SIGKILL");
-              } catch {
-                child.kill("SIGKILL");
-              }
-            }
-          };
-          lifetime.addEventListener("abort", stopEarly, { once: true });
           try {
-            if (!(await Promise.race([verified, exited, failed])) || lifetime.aborted) {
-              stopEarly();
-              throw new ApprovalRefused(
-                "Host command refused: the working directory changed before execution, or the call was cancelled.",
-              );
-            }
+            await launchedInApprovedDirectory(child, verified, lifetime);
           } finally {
-            lifetime.removeEventListener("abort", stopEarly);
             report?.destroy();
           }
           const info = background.tasks.add({
@@ -519,15 +509,7 @@ export function registerHostBash(
         }
         const limit = AbortSignal.timeout(options.timeoutSeconds * 1000);
         const run = AbortSignal.any([lifetime, limit]);
-        const kill = () => {
-          if (child.pid) {
-            try {
-              process.kill(-child.pid, "SIGKILL");
-            } catch {
-              child.kill("SIGKILL");
-            }
-          }
-        };
+        const kill = () => killProcessGroup(child);
         run.addEventListener("abort", kill, { once: true });
         if (run.aborted) kill();
         try {

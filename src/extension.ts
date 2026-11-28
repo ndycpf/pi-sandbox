@@ -11,16 +11,10 @@ import {
 import { Key } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import {
-  BACKGROUND_TOOL,
-  BackgroundTasks,
-  describeTask,
-  exitMessage,
-  registerBackgroundTool,
-  sessionLivenessRegistry,
-  statusText,
-  widgetLines,
-} from "./background.ts";
+import type { SpawnedTask } from "./background-session.ts";
+
+import { createBackgroundSession } from "./background-session.ts";
+import { BACKGROUND_TOOL } from "./background-tool.ts";
 import {
   addDomainToConfig,
   addReadPathToConfig,
@@ -84,57 +78,14 @@ export default function (pi: ExtensionAPI) {
   let hostBash: ReturnType<typeof registerHostBash> | undefined;
   let projectTrusted = false;
   const allowances: SessionAllowances = { domains: [], readPaths: [], writePaths: [] };
+  const backgroundConfig = (cwd: string) =>
+    resolveBackgroundBashConfig(loadConfig(cwd, projectTrusted).backgroundBash);
   // Long-running tasks belong to this session and this sandbox: they are
   // stopped on shutdown and whenever the sandbox is turned on or off.
-  // The UI of the current session, for the footer count of running tasks.
-  // Plain text in RPC: the status and widget are sent to the client as-is.
-  let backgroundUi:
-    | { ui: Parameters<typeof showPermissionPrompt>[1]["ui"]; tui: boolean }
-    | undefined;
-  const backgroundTasks = new BackgroundTasks(
-    (exit) => {
-      try {
-        pi.sendMessage(
-          { customType: "bash-background", content: exitMessage(exit), display: true },
-          { deliverAs: "steer" },
-        );
-      } catch {
-        // The session may be gone.
-      }
-    },
-    () => {
-      try {
-        if (!backgroundUi) return;
-        const { ui, tui } = backgroundUi;
-        const all = backgroundTasks.list();
-        const status = statusText(all);
-        ui.setStatus("background", status && tui ? ui.theme.fg("accent", status) : status);
-        ui.setWidget("background", widgetLines(all), { placement: "belowEditor" });
-      } catch {
-        // The session may be gone.
-      }
-    },
-  );
-  let backgroundToolRegistered = false;
-  // Keeps RPC hosts (Orca, pi-web) from idle-stopping Pi while tasks run.
-  let releaseLiveness: (() => void) | undefined;
-  function trackLiveness(ctx: ExtensionContext) {
-    releaseLiveness?.();
-    releaseLiveness = undefined;
-    const sessionId = ctx.sessionManager?.getSessionId?.();
-    if (!sessionId) return;
-    const sessionFile = ctx.sessionManager.getSessionFile?.();
-    try {
-      releaseLiveness = sessionLivenessRegistry().register({
-        name: "pi-sandbox background tasks",
-        sessionId,
-        ...(sessionFile ? { sessionFile } : {}),
-        isActive: () => backgroundTasks.running() > 0,
-      });
-    } catch {
-      // Another extension installed an incompatible registry; nothing to keep alive then.
-    }
-  }
+  const background = createBackgroundSession(pi, {
+    config: backgroundConfig,
+    spawn: spawnBackground,
+  });
 
   const effectiveAllowances = (cwd: string) =>
     resolveAllowances(loadConfig(cwd, projectTrusted), allowances);
@@ -204,7 +155,7 @@ export default function (pi: ExtensionAPI) {
 
     hostBash?.start(ctx);
     // Tasks started while the sandbox was off must not keep running unsandboxed.
-    await backgroundTasks.stopAll();
+    await background.tasks.stopAll();
     try {
       await initializeSandbox(sandboxManager, config, allowances, ctx.cwd);
       if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
@@ -237,7 +188,7 @@ export default function (pi: ExtensionAPI) {
 
     hostBash?.stop();
     cancelPermissionPrompts(pi);
-    await backgroundTasks.stopAll();
+    await background.tasks.stopAll();
     if (sandboxInitialized) {
       try {
         await reviewSandbox.reset();
@@ -401,101 +352,18 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  function registerBackgroundCommand() {
-    pi.registerCommand("background", {
-      description: "List background tasks, or stop them: /background stop [id|all]",
-      handler: async (args, ctx) => {
-        const [action = "list", target] = args.trim().split(/\s+/).filter(Boolean);
-        if (action === "list" && ctx.mode === "rpc" && ctx.hasUI) {
-          // Some RPC clients (Orca's native chat) drop notify, setStatus and
-          // setWidget and show only dialogs, so list the tasks in one.
-          const all = backgroundTasks.list();
-          if (!all.length) {
-            await ctx.ui.select("No background tasks.", ["Close"]);
-            return;
-          }
-          const lines = all.map(describeTask);
-          const choice = await ctx.ui.select("Background tasks (pick a running one to stop it)", [
-            ...lines,
-            "Close",
-          ]);
-          const task = choice === undefined ? undefined : all[lines.indexOf(choice)];
-          if (!task || task.state === "exited") return;
-          if (await ctx.ui.confirm("Stop background task?", describeTask(task))) {
-            await backgroundTasks.stop(task.id);
-          }
-          return;
-        }
-        if (action === "list") {
-          const all = backgroundTasks.list();
-          ctx.ui.notify(
-            all.length ? all.map(describeTask).join("\n") : "No background tasks.",
-            "info",
-          );
-          return;
-        }
-        if (action === "stop" && target === "all") {
-          await backgroundTasks.stopAll();
-          ctx.ui.notify("Stopped all background tasks.", "info");
-          return;
-        }
-        if (action === "stop" && !target) {
-          // Pick a task: Pi's selector in the TUI, a select dialog in RPC clients.
-          const live = backgroundTasks.list().filter((task) => task.state !== "exited");
-          if (!live.length) {
-            ctx.ui.notify("No background tasks are running.", "info");
-            return;
-          }
-          if (!ctx.hasUI) {
-            ctx.ui.notify("Usage: /background stop <id|all>", "error");
-            return;
-          }
-          const lines = live.map(describeTask);
-          const choice = await ctx.ui.select("Stop which background task?", lines);
-          const task = choice === undefined ? undefined : live[lines.indexOf(choice)];
-          if (!task) return;
-          const stopped = await backgroundTasks.stop(task.id);
-          if (stopped) ctx.ui.notify(`Stopped: ${describeTask(stopped)}`, "info");
-          return;
-        }
-        if (action === "stop" && target) {
-          const stopped = await backgroundTasks.stop(target);
-          ctx.ui.notify(
-            stopped ? `Stopped: ${describeTask(stopped)}` : `Unknown background task: ${target}`,
-            stopped ? "info" : "error",
-          );
-          return;
-        }
-        ctx.ui.notify("Usage: /background [list] | /background stop [id|all]", "error");
-      },
-    });
-  }
-
-  async function startBackground(command: string, ctx: Parameters<typeof showPermissionPrompt>[1]) {
+  async function spawnBackground(command: string, ctx: ExtensionContext): Promise<SpawnedTask> {
     const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted });
     const prefix = settings.getShellCommandPrefix();
     const full = prefix ? `${prefix}\n${command}` : command;
-    const config = loadConfig(ctx.cwd, projectTrusted);
-    const limits = resolveBackgroundBashConfig(config.backgroundBash);
-    const common = {
-      command,
-      cwd: ctx.cwd,
-      bufferBytes: limits.bufferBytes,
-      visibleBytes: limits.outputBytes,
-    };
     if (sandboxEnabled && sandboxInitialized) {
       const child = await spawnSandboxed(sandboxManager, full, ctx.cwd, {
         shellPath: settings.getShellPath(),
-        sshProxy: config.network?.sshProxy !== false,
+        sshProxy: loadConfig(ctx.cwd, projectTrusted).network?.sshProxy !== false,
         env: process.env,
       });
-      return backgroundTasks.add({
-        ...common,
-        kind: "sandbox",
-        child,
-        // Linux deny rules rely on mount points the runtime keeps until this runs.
-        cleanup: () => sandboxManager.cleanupAfterCommand(),
-      });
+      // Linux deny rules rely on mount points the runtime keeps until this runs.
+      return { kind: "sandbox", child, cleanup: () => sandboxManager.cleanupAfterCommand() };
     }
     // With the sandbox off, ordinary bash is unsandboxed too.
     const { shell, args } = getShellConfig(settings.getShellPath());
@@ -505,7 +373,7 @@ export default function (pi: ExtensionAPI) {
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    return backgroundTasks.add({ ...common, kind: "unsandboxed", child });
+    return { kind: "unsandboxed", child };
   }
 
   pi.registerTool({
@@ -665,7 +533,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     hostBash?.stop();
-    await backgroundTasks.stopAll();
+    await background.tasks.stopAll();
     projectTrusted = ctx.isProjectTrusted();
     if (loadConfig(ctx.cwd, projectTrusted).enableAccessRequestTool === true) {
       registerAccessTools();
@@ -679,30 +547,16 @@ export default function (pi: ExtensionAPI) {
         // The auto-reviewer reads through the sandbox, read-only and offline.
         {
           reviewExec: reviewSandbox.exec,
-          background: {
-            tasks: backgroundTasks,
-            limits: (cwd) =>
-              resolveBackgroundBashConfig(loadConfig(cwd, projectTrusted).backgroundBash),
-          },
+          background: { tasks: background.tasks, limits: backgroundConfig },
         },
       );
     }
     const startupConfig = loadConfig(ctx.cwd, projectTrusted);
-    const hostBackground =
-      startupConfig.hostBash?.enabled === true && startupConfig.hostBash.allowBackground === true;
-    backgroundUi = ctx.hasUI ? { ui: ctx.ui, tui: ctx.mode === "tui" } : undefined;
-    trackLiveness(ctx);
-    if (!backgroundToolRegistered && (startupConfig.backgroundBash?.enabled || hostBackground)) {
-      backgroundToolRegistered = true;
-      registerBackgroundCommand();
-      registerBackgroundTool(pi, {
-        tasks: backgroundTasks,
-        config: (cwd) =>
-          resolveBackgroundBashConfig(loadConfig(cwd, projectTrusted).backgroundBash),
-        hostBackground,
-        start: startBackground,
-      });
-    }
+    background.attach(ctx, {
+      enabled: startupConfig.backgroundBash?.enabled === true,
+      hostBackground:
+        startupConfig.hostBash?.enabled === true && startupConfig.hostBash.allowBackground === true,
+    });
     if (pi.getFlag("no-sandbox") as boolean) {
       sandboxEnabled = false;
       ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
@@ -720,10 +574,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     hostBash?.stop();
     cancelPermissionPrompts(pi);
-    await backgroundTasks.stopAll();
-    backgroundUi = undefined;
-    releaseLiveness?.();
-    releaseLiveness = undefined;
+    await background.detach();
     if (!sandboxInitialized) return;
     try {
       await reviewSandbox.reset();

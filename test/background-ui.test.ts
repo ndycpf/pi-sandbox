@@ -10,8 +10,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import assert from "node:assert/strict";
 
-import { sessionLivenessRegistry } from "../src/background.ts";
 import extension from "../src/extension.ts";
+import { sessionLivenessRegistry } from "../src/session-liveness.ts";
 
 const unix = ["linux", "darwin"].includes(process.platform);
 

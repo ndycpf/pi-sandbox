@@ -9,13 +9,8 @@ import test, { type TestContext } from "node:test";
 import { createSandboxManager } from "@carderne/sandbox-runtime";
 import assert from "node:assert/strict";
 
-import {
-  type BackgroundExit,
-  BackgroundTasks,
-  OutputTail,
-  registerBackgroundTool,
-  statusText,
-} from "../src/background.ts";
+import { type BackgroundExit, BackgroundTasks } from "../src/background-tasks.ts";
+import { registerBackgroundTool, statusText } from "../src/background-tool.ts";
 import {
   DEFAULT_BACKGROUND_BASH_CONFIG,
   DEFAULT_CONFIG,
@@ -24,6 +19,7 @@ import {
   resolveBackgroundBashConfig,
 } from "../src/config.ts";
 import { promptTitle, registerHostBash, titleRows } from "../src/host-bash.ts";
+import { OutputTail } from "../src/output-tail.ts";
 import { initializeSandbox, spawnSandboxed } from "../src/sandbox-runtime.ts";
 
 const unix = ["linux", "darwin"].includes(process.platform);

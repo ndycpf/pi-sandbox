@@ -10,9 +10,9 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import type { BackgroundTasks } from "./background-tasks.ts";
 import type { ReviewExec } from "./host-review-tools.ts";
 
+import { type BackgroundTasks, Reservation, StaleStartError } from "./background-tasks.ts";
 import {
   type BackgroundBashConfig,
   DEFAULT_HOST_BASH_CONFIG,
@@ -336,14 +336,27 @@ export function registerHostBash(
         throw new Error(refusal);
       }
       if (!options.enabled) throw new Error(refusal);
+      // The tool's parameters are fixed at registration; the setting is read per call.
+      if (inBackground && !options.allowBackground) {
+        throw new ApprovalRefused(
+          "Host command refused before prompting: background runs are turned off (hostBash.allowBackground in the global sandbox.json). " +
+            "Run it in the foreground without background: true, or ask the operator.",
+        );
+      }
+      // Held from before approval until the task is added, so concurrent calls cannot pass the limit.
+      let slot: Reservation | undefined;
       if (inBackground) {
         const { maxTasks } = background.limits(ctx.cwd);
-        if (background.tasks.running() >= maxTasks) {
+        const reserved = background.tasks.reserve(maxTasks);
+        if (!(reserved instanceof Reservation)) {
           throw new ApprovalRefused(
-            `Host command refused before prompting: ${maxTasks} background tasks are already running ` +
-              "(backgroundBash.maxTasks). Stop one with bash_background stop first.",
+            reserved.refused === "full"
+              ? `Host command refused before prompting: ${maxTasks} background tasks are already running or starting ` +
+                  "(backgroundBash.maxTasks). Stop one with bash_background stop first."
+              : "Host command refused before prompting: the sandbox is being turned on or off, or the session is ending. Try again.",
           );
         }
+        slot = reserved;
       }
       busy = true;
       let fd: number | undefined;
@@ -488,6 +501,7 @@ export function registerHostBash(
             command,
             cwd,
             child,
+            reservation: slot,
             bufferBytes: Math.max(options.outputBytes, 4096),
             visibleBytes: options.outputBytes,
           });
@@ -554,9 +568,15 @@ export function registerHostBash(
           report?.destroy();
         }
       } catch (error) {
-        if (error instanceof ApprovalRefused || error instanceof HostCommandStopped) throw error;
+        if (
+          error instanceof ApprovalRefused ||
+          error instanceof HostCommandStopped ||
+          error instanceof StaleStartError
+        )
+          throw error;
         throw new Error(started ? "Host command interrupted." : refusal);
       } finally {
+        slot?.release();
         busy = false;
         if (fd !== undefined) closeSync(fd);
       }

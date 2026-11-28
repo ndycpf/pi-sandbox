@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import assert from "node:assert/strict";
 
+import { createBackgroundSession } from "../src/background-session.ts";
+import { DEFAULT_BACKGROUND_BASH_CONFIG } from "../src/config.ts";
 import extension from "../src/extension.ts";
 import { sessionLivenessRegistry } from "../src/session-liveness.ts";
 
@@ -149,3 +152,63 @@ test("/background lists tasks in a dialog in RPC mode", { skip: !unix }, async (
   assert.deepEqual(ui.confirms, ["Stop background task?"]);
   assert.equal(ui.widgets.get("background"), undefined);
 });
+
+test(
+  "no task starts, or survives from before, while the sandbox changes",
+  { skip: !unix },
+  async () => {
+    const tools = new Map<string, Tool>();
+    const api = {
+      registerTool: (tool: Tool) => tools.set(tool.name, tool),
+      registerCommand: () => {},
+      sendMessage: () => {},
+    } as unknown as ExtensionAPI;
+    let spawnGate!: () => void;
+    let gated = false;
+    const spawned: ReturnType<typeof spawn>[] = [];
+    const session = createBackgroundSession(api, {
+      config: () => ({ ...DEFAULT_BACKGROUND_BASH_CONFIG, enabled: true }),
+      spawn: async (command) => {
+        // The first spawn is slow, as sandbox wrapping can be.
+        if (!gated) {
+          gated = true;
+          await new Promise<void>((resolve) => (spawnGate = resolve));
+        }
+        const child = spawn("/bin/sh", ["-c", command], {
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        spawned.push(child);
+        return { kind: "unsandboxed", child };
+      },
+    });
+    const ctx = {
+      cwd: tmpdir(),
+      hasUI: false,
+      sessionManager: SessionManager.inMemory(tmpdir()),
+    } as unknown as ExtensionToolContext;
+    session.attach(ctx, { enabled: true, hostBackground: false });
+    const tool = tools.get("bash_background")!;
+    const start = () =>
+      tool.execute("t", { action: "start", command: "exec sleep 30" }, undefined, undefined, ctx);
+
+    const inFlight = start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    let duringChange: Promise<unknown> | undefined;
+    const changed = session.whileStopped(async () => {
+      duringChange = start();
+      spawnGate();
+      await assert.rejects(inFlight, /while it was starting/);
+    });
+    await changed;
+    await assert.rejects(duringChange!, /cannot start right now/);
+    assert.equal(session.tasks.running(), 0);
+    // The process spawned for the stale start was killed.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.ok(spawned.every((child) => child.exitCode !== null || child.signalCode !== null));
+    // Starts work again once the change is done.
+    await start();
+    assert.equal(session.tasks.running(), 1);
+    await session.detach();
+  },
+);

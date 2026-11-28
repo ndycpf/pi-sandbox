@@ -9,7 +9,12 @@ import test, { type TestContext } from "node:test";
 import { createSandboxManager } from "@carderne/sandbox-runtime";
 import assert from "node:assert/strict";
 
-import { type BackgroundExit, BackgroundTasks } from "../src/background-tasks.ts";
+import {
+  type BackgroundExit,
+  BackgroundTasks,
+  Reservation,
+  StaleStartError,
+} from "../src/background-tasks.ts";
 import { registerBackgroundTool, statusText } from "../src/background-tool.ts";
 import {
   DEFAULT_BACKGROUND_BASH_CONFIG,
@@ -291,6 +296,8 @@ function hostFixture(
     allowBackground: boolean;
     select?: (title: string) => string;
     mode?: "tui" | "rpc";
+    /** Holds each approval prompt until it resolves. */
+    gate?: Promise<void>;
   },
 ) {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-host-bg-")));
@@ -306,6 +313,8 @@ function hostFixture(
   }
   const tasks = new BackgroundTasks();
   t.after(() => tasks.stopAll(200));
+  // Read on every call, like the global config.
+  const settings = { allowBackground: options.allowBackground };
   let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
   const host = registerHostBash(
     { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,
@@ -314,7 +323,7 @@ function hostFixture(
       ...DEFAULT_HOST_BASH_CONFIG,
       enabled: true,
       timeoutSeconds: 1,
-      allowBackground: options.allowBackground,
+      allowBackground: settings.allowBackground,
     }),
     {
       background: {
@@ -332,6 +341,7 @@ function hostFixture(
     ui: {
       select: async (title: string) => {
         titles.push(title);
+        await options.gate;
         return options.select ? options.select(title) : "Allow once";
       },
       notify: () => {},
@@ -344,7 +354,7 @@ function hostFixture(
     const [content] = result.content;
     return { text: content?.type === "text" ? content.text : "", details: result.details };
   };
-  return { tool: () => tool, tasks, titles, run };
+  return { tool: () => tool, tasks, titles, run, settings };
 }
 
 test(
@@ -516,3 +526,177 @@ test(
     await tasks.stopAll(200);
   },
 );
+
+test(
+  "stop waits for the whole process group, even after the shell exits",
+  { skip: !unix },
+  async () => {
+    const tasks = new BackgroundTasks();
+    // The shell exits on SIGTERM; its worker ignores SIGTERM and keeps running.
+    const info = tasks.add({
+      kind: "host",
+      command: "",
+      cwd: tmpdir(),
+      child: sh("(trap '' TERM; exec sleep 30) & echo worker=$!; wait"),
+      bufferBytes: 1024,
+      visibleBytes: 1024,
+    });
+    await until(() => /worker=\d+/.test(tasks.logs(info.id)!.text));
+    const worker = Number(/worker=(\d+)/.exec(tasks.logs(info.id)!.text)![1]);
+    const stopping = tasks.stop(info.id, 300);
+    // Still stopping while the worker lives, and counted against the limit.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(tasks.get(info.id)?.state, "stopping");
+    assert.equal(tasks.running(), 1);
+    const stopped = await stopping;
+    assert.equal(stopped?.state, "exited");
+    await until(() => !alive(worker));
+  },
+);
+
+test(
+  "a stop that the group obeys returns without waiting for the grace period",
+  { skip: !unix },
+  async () => {
+    const tasks = new BackgroundTasks();
+    const info = tasks.add({
+      kind: "sandbox",
+      command: "",
+      cwd: tmpdir(),
+      child: sh("sleep 30 & wait"),
+      bufferBytes: 1024,
+      visibleBytes: 0,
+    });
+    const begun = Date.now();
+    await tasks.stop(info.id, 5000);
+    assert.ok(Date.now() - begun < 2000);
+  },
+);
+
+test(
+  "reservations count against the limit and holds refuse and expire them",
+  { skip: !unix },
+  async () => {
+    const tasks = new BackgroundTasks();
+    const first = tasks.reserve(1);
+    assert.ok(first instanceof Reservation);
+    assert.deepEqual(tasks.reserve(1), { refused: "full" });
+    first.release();
+    first.release();
+    const second = tasks.reserve(1);
+    assert.ok(second instanceof Reservation);
+    const added = tasks.add({
+      kind: "sandbox",
+      command: "sleep 30",
+      cwd: tmpdir(),
+      child: sh("sleep 30"),
+      bufferBytes: 1024,
+      visibleBytes: 0,
+      reservation: second,
+    });
+    // The task now holds the slot; the reservation does not count twice.
+    assert.deepEqual(tasks.reserve(2) instanceof Reservation, true);
+    await tasks.stop(added.id, 200);
+
+    const early = tasks.reserve(4) as Reservation;
+    const release = tasks.hold();
+    assert.deepEqual(tasks.reserve(4), { refused: "held" });
+    let cleaned = 0;
+    const child = sh("echo started; exec sleep 30");
+    assert.throws(
+      () =>
+        tasks.add({
+          kind: "sandbox",
+          command: "sleep 30",
+          cwd: tmpdir(),
+          child,
+          bufferBytes: 1024,
+          visibleBytes: 0,
+          cleanup: () => cleaned++,
+          reservation: early,
+        }),
+      StaleStartError,
+    );
+    await until(() => child.exitCode !== null || child.signalCode !== null);
+    await until(() => cleaned === 1);
+    assert.equal(tasks.running(), 0);
+    release();
+    assert.ok(tasks.reserve(4) instanceof Reservation);
+  },
+);
+
+test("concurrent starts cannot pass maxTasks", { skip: !unix }, async () => {
+  const tasks = new BackgroundTasks();
+  let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
+  registerBackgroundTool(
+    { registerTool: (def: typeof tool) => (tool = def) } as unknown as ExtensionAPI,
+    {
+      tasks,
+      config: () => ({ ...DEFAULT_BACKGROUND_BASH_CONFIG, enabled: true, maxTasks: 1 }),
+      hostBackground: false,
+      start: async (command, ctx, reservation) => {
+        // Spawning takes a while, as wrapping for the sandbox does.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return tasks.add({
+          kind: "sandbox",
+          command,
+          cwd: ctx.cwd,
+          child: sh(command, ctx.cwd),
+          bufferBytes: 1024,
+          visibleBytes: 0,
+          reservation,
+        });
+      },
+    },
+  );
+  const ctx = { cwd: tmpdir() } as unknown as ExtensionToolContext;
+  const start = () =>
+    tool.execute("t", { action: "start", command: "exec sleep 30" }, undefined, undefined, ctx);
+  const results = await Promise.allSettled([start(), start()]);
+  assert.deepEqual(
+    results.map((result) => result.status),
+    ["fulfilled", "rejected"],
+  );
+  assert.match(String((results[1] as PromiseRejectedResult).reason), /Too many background tasks/);
+  assert.equal(tasks.running(), 1);
+
+  // A failed spawn gives its slot back.
+  await tasks.stopAll(200);
+  const release = tasks.hold();
+  await assert.rejects(start(), /cannot start right now/);
+  release();
+  assert.ok(tasks.reserve(1) instanceof Reservation);
+});
+
+test(
+  "turning hostBash.allowBackground off applies to the registered tool",
+  { skip: !unix },
+  async (t) => {
+    const { run, settings, tasks, titles } = hostFixture(t, { allowBackground: true });
+    settings.allowBackground = false;
+    await assert.rejects(
+      run({ command: "exec sleep 30", background: true }),
+      /background runs are turned off/,
+    );
+    assert.equal(titles.length, 0);
+    assert.equal(tasks.running(), 0);
+  },
+);
+
+test("a host_bash background call awaiting approval holds its slot", { skip: !unix }, async (t) => {
+  let approve!: () => void;
+  const gate = new Promise<void>((resolve) => (approve = resolve));
+  const { run, tasks } = hostFixture(t, {
+    allowBackground: true,
+    select: () => "Allow once",
+    gate,
+  });
+  // The fixture's limit is one task; the host call holds it while the operator decides.
+  const pending = run({ command: "exec sleep 30", background: true });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(tasks.reserve(1), { refused: "full" });
+  approve();
+  await pending;
+  assert.equal(tasks.running(), 1);
+  assert.deepEqual(tasks.reserve(1), { refused: "full" });
+});

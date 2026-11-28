@@ -7,6 +7,7 @@ import {
   type BackgroundTaskInfo,
   BackgroundTasks,
   isLive,
+  type Reservation,
 } from "./background-tasks.ts";
 import {
   describeTask,
@@ -38,6 +39,8 @@ export function createBackgroundSession(pi: ExtensionAPI, deps: BackgroundSessio
   let ui: { ui: ExtensionContext["ui"]; tui: boolean } | undefined;
   let releaseLiveness: (() => void) | undefined;
   let registered = false;
+  // Held from session shutdown until the next session attaches.
+  let ended: (() => void) | undefined;
 
   const showTasks = () => {
     if (!ui) return;
@@ -62,11 +65,16 @@ export function createBackgroundSession(pi: ExtensionAPI, deps: BackgroundSessio
     }
   }, showTasks);
 
-  async function start(command: string, ctx: ExtensionContext): Promise<BackgroundTaskInfo> {
+  async function start(
+    command: string,
+    ctx: ExtensionContext,
+    reservation: Reservation,
+  ): Promise<BackgroundTaskInfo> {
     const limits = deps.config(ctx.cwd);
     const spawned = await deps.spawn(command, ctx);
     return tasks.add({
       ...spawned,
+      reservation,
       command,
       cwd: ctx.cwd,
       bufferBytes: limits.bufferBytes,
@@ -149,6 +157,8 @@ export function createBackgroundSession(pi: ExtensionAPI, deps: BackgroundSessio
      * sandboxed or host background tasks are enabled at startup.
      */
     attach(ctx: ExtensionContext, options: { enabled: boolean; hostBackground: boolean }) {
+      ended?.();
+      ended = undefined;
       ui = ctx.hasUI ? { ui: ctx.ui, tui: ctx.mode === "tui" } : undefined;
       releaseLiveness?.();
       // Keeps RPC hosts (Orca, pi-web) from idle-stopping Pi while tasks run.
@@ -167,8 +177,22 @@ export function createBackgroundSession(pi: ExtensionAPI, deps: BackgroundSessio
         start,
       });
     },
-    /** Stop every task and let go of the session. */
+    /**
+     * Stop every task while no new one can start, then run `change` (turning
+     * the sandbox on or off) before starts are allowed again.
+     */
+    async whileStopped<T>(change: () => Promise<T>): Promise<T> {
+      const release = tasks.hold();
+      try {
+        await tasks.stopAll();
+        return await change();
+      } finally {
+        release();
+      }
+    },
+    /** Stop every task and let go of the session; starts stay refused until the next attach. */
     async detach() {
+      ended ??= tasks.hold();
       await tasks.stopAll();
       ui = undefined;
       releaseLiveness?.();

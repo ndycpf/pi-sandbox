@@ -28,8 +28,14 @@ type Task = {
   tail: OutputTail;
   /** Bytes of output the agent may see from this task (host_bash's outputBytes for host tasks). */
   visibleBytes: number;
+  /** Resolves when the task is over: its shell exited and, if stopped, its process group is gone. */
   exited: Promise<void>;
-  killTimer?: NodeJS.Timeout;
+  /** Resolves when the task's shell has exited. */
+  shellExited: Promise<void>;
+  /** Ends the task once a stop has seen its process group go. */
+  finalize: () => void;
+  /** Set by stop() until the process group is gone or killed. */
+  stopping?: Promise<void>;
   /** Called on new output and on exit, for `wait`. */
   listeners: Set<() => void>;
 };
@@ -41,10 +47,45 @@ export type WaitResult = {
 
 /** How long a task gets after SIGTERM before its process group is killed. */
 export const STOP_GRACE_MS = 2000;
+/** How often a stop checks whether the process group is gone. */
+const GROUP_POLL_MS = 25;
 /** Finished tasks kept for `logs` and `list`. */
 const KEEP_FINISHED = 20;
 
 export type BackgroundExit = { info: BackgroundTaskInfo; tail: string };
+
+/** Whether any process in the group led by `pid` still exists. */
+function groupAlive(pid: number | undefined) {
+  if (!pid) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * A slot held for a task that is being started (spawned or approved), so
+ * concurrent starts cannot exceed the limit. Pass it to `add`, or release it
+ * when the start fails.
+ */
+export class Reservation {
+  private done = false;
+  constructor(
+    readonly epoch: number,
+    private readonly free: () => void,
+  ) {}
+  /** Give the slot back. Safe to call more than once. */
+  release() {
+    if (this.done) return;
+    this.done = true;
+    this.free();
+  }
+}
+
+/** A start whose sandbox state changed before it finished; its process was killed. */
+export class StaleStartError extends Error {}
 
 /**
  * Tracks long-running processes started for the agent. Every task belongs to
@@ -56,6 +97,10 @@ export class BackgroundTasks {
   private tasks = new Map<string, Task>();
   private next = 1;
   private exitHook?: () => void;
+  private reserved = 0;
+  private holds = 0;
+  /** Bumped by `hold`, so starts begun before it cannot add a task after it. */
+  private epoch = 0;
 
   constructor(
     private readonly onExit?: (exit: BackgroundExit) => void,
@@ -70,8 +115,38 @@ export class BackgroundTasks {
   }
 
   /**
+   * Reserve a slot for a new task, counting running tasks and other
+   * reservations against `max`. Returns why not when the limit is reached or
+   * starts are held (the sandbox is changing or the session is ending).
+   */
+  reserve(max: number): Reservation | { refused: "full" | "held" } {
+    if (this.holds > 0) return { refused: "held" };
+    if (this.running() + this.reserved >= max) return { refused: "full" };
+    this.reserved++;
+    return new Reservation(this.epoch, () => this.reserved--);
+  }
+
+  /**
+   * Refuse new starts until the returned function is called. Starts already in
+   * flight are killed when they try to add their task, so a stopAll during the
+   * hold leaves nothing from before it running.
+   */
+  hold(): () => void {
+    this.holds++;
+    this.epoch++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.holds--;
+    };
+  }
+
+  /**
    * Take ownership of a spawned child. It must be spawned `detached` so its
-   * process group can be signalled. `cleanup` runs once, after it exits.
+   * process group can be signalled. `cleanup` runs once, after it exits. With a
+   * reservation from before the latest `hold`, the child is killed instead and
+   * StaleStartError is thrown.
    */
   add(options: {
     kind: BackgroundKind;
@@ -81,8 +156,30 @@ export class BackgroundTasks {
     bufferBytes: number;
     visibleBytes: number;
     cleanup?: () => void;
+    reservation?: Reservation;
   }): BackgroundTaskInfo {
     const { child } = options;
+    options.reservation?.release();
+    if (options.reservation && options.reservation.epoch !== this.epoch) {
+      killProcessGroup(child, "SIGKILL");
+      const cleanup = options.cleanup;
+      if (cleanup) {
+        let once = false;
+        const run = () => {
+          if (once) return;
+          once = true;
+          cleanup();
+        };
+        if (child.exitCode !== null || child.signalCode !== null) run();
+        else {
+          child.once("exit", run);
+          child.once("error", run);
+        }
+      }
+      throw new StaleStartError(
+        "Background task not started: the sandbox was turned on or off, or the session ended, while it was starting.",
+      );
+    }
     const id = `bg${this.next++}`;
     const tail = new OutputTail(Math.max(1, options.bufferBytes));
     const info: BackgroundTaskInfo = {
@@ -104,44 +201,52 @@ export class BackgroundTasks {
       });
       stream?.on("error", () => {});
     }
-    let cleaned = false;
-    const exited = new Promise<void>((resolve) => {
-      const finish = (code: number | null, signal: NodeJS.Signals | null) => {
-        if (info.state === "exited") return;
-        // Tasks the agent or the session stopped are not reported again.
-        const stopped = info.state === "stopping";
-        const task = this.tasks.get(id);
-        if (task?.killTimer) clearTimeout(task.killTimer);
-        info.state = "exited";
-        info.exitCode = code;
-        info.signal = signal;
-        info.endedAt = new Date().toISOString();
-        // Detached descendants may hold the pipes open; the task is over when
-        // its shell is, and stop() already signalled the whole group.
-        child.stdout?.destroy();
-        child.stderr?.destroy();
-        if (!cleaned) {
-          cleaned = true;
-          options.cleanup?.();
-        }
-        this.prune();
-        this.updateExitHook();
-        resolve();
-        for (const listener of listeners) listener();
-        if (!stopped)
-          this.onExit?.({ info: { ...info }, tail: tail.text(task?.visibleBytes ?? 0) });
-      };
-      child.once("exit", finish);
-      child.once("error", () => finish(null, null));
-    });
-    this.tasks.set(id, {
+    let resolveExited!: () => void;
+    const exited = new Promise<void>((resolve) => (resolveExited = resolve));
+    let resolveShell!: () => void;
+    const shellExited = new Promise<void>((resolve) => (resolveShell = resolve));
+    let finalized = false;
+    const finalize = () => {
+      if (finalized) return;
+      finalized = true;
+      // Tasks the agent or the session stopped are not reported again.
+      const stopped = info.state === "stopping";
+      info.state = "exited";
+      info.endedAt = new Date().toISOString();
+      // Detached descendants may hold the pipes open; the task is over when
+      // its shell is (and, when stopped, its whole process group).
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      options.cleanup?.();
+      this.prune();
+      this.updateExitHook();
+      resolveExited();
+      for (const listener of listeners) listener();
+      if (!stopped) this.onExit?.({ info: { ...info }, tail: tail.text(task.visibleBytes) });
+    };
+    let shellDone = false;
+    const shellExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (shellDone) return;
+      shellDone = true;
+      info.exitCode = code;
+      info.signal = signal;
+      resolveShell();
+      // A stop finalizes once the rest of the process group is gone too.
+      if (info.state !== "stopping") finalize();
+    };
+    child.once("exit", shellExit);
+    child.once("error", () => shellExit(null, null));
+    const task: Task = {
       info,
       child,
       tail,
       visibleBytes: Math.min(options.visibleBytes, tail.limit),
       exited,
+      shellExited,
+      finalize,
       listeners,
-    });
+    };
+    this.tasks.set(id, task);
     this.updateExitHook();
     return { ...info };
   }
@@ -201,18 +306,39 @@ export class BackgroundTasks {
     return { info: { ...task.info }, text: limit > 0 ? task.tail.text(limit) : "" };
   }
 
-  /** SIGTERM the task's process group, then SIGKILL it after a grace period. */
+  /**
+   * SIGTERM the task's process group, then SIGKILL it if anything in the
+   * group is left after the grace period, even when the shell itself exited
+   * earlier. Resolves once the task is over.
+   */
   async stop(id: string, graceMs = STOP_GRACE_MS): Promise<BackgroundTaskInfo | undefined> {
     const task = this.tasks.get(id);
     if (!task) return undefined;
     if (task.info.state === "running") {
       task.info.state = "stopping";
       this.onChange?.();
-      killProcessGroup(task.child, "SIGTERM");
-      task.killTimer = setTimeout(() => killProcessGroup(task.child, "SIGKILL"), graceMs);
+      task.stopping = this.supervise(task, graceMs);
     }
+    await task.stopping;
     await task.exited;
     return { ...task.info };
+  }
+
+  private async supervise(task: Task, graceMs: number) {
+    const pid = task.child.pid;
+    killProcessGroup(task.child, "SIGTERM");
+    const deadline = Date.now() + graceMs;
+    let shellDone = false;
+    void task.shellExited.then(() => (shellDone = true));
+    while (Date.now() < deadline) {
+      if (shellDone && !groupAlive(pid)) break;
+      await new Promise((resolve) => setTimeout(resolve, GROUP_POLL_MS));
+    }
+    if (!shellDone || groupAlive(pid)) {
+      killProcessGroup(task.child, "SIGKILL");
+      await task.shellExited;
+    }
+    task.finalize();
   }
 
   /** Stop every task and wait for them to exit. */

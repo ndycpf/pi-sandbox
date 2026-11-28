@@ -154,28 +154,30 @@ export default function (pi: ExtensionAPI) {
     }
 
     hostBash?.start(ctx);
-    // Tasks started while the sandbox was off must not keep running unsandboxed.
-    await background.tasks.stopAll();
-    try {
-      await initializeSandbox(sandboxManager, config, allowances, ctx.cwd);
-      if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
-        process.env.NODE_USE_ENV_PROXY ??= "1";
+    // Tasks started while the sandbox was off must not keep running
+    // unsandboxed, and none may start until it is on.
+    return background.whileStopped(async () => {
+      try {
+        await initializeSandbox(sandboxManager, config, allowances, ctx.cwd);
+        if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
+          process.env.NODE_USE_ENV_PROXY ??= "1";
+        }
+        resetPermissionPrompts(pi);
+        sandboxEnabled = true;
+        sandboxInitialized = true;
+        warnIfAllDomainsAllowed(ctx, config);
+        warnIfLinuxUnenforcedGlobs(ctx, config);
+        updateStatus(ctx, config);
+        return true;
+      } catch (error) {
+        sandboxEnabled = false;
+        ctx.ui.notify(
+          `Sandbox initialization failed: ${error instanceof Error ? error.message : error}`,
+          "error",
+        );
+        return false;
       }
-      resetPermissionPrompts(pi);
-      sandboxEnabled = true;
-      sandboxInitialized = true;
-      warnIfAllDomainsAllowed(ctx, config);
-      warnIfLinuxUnenforcedGlobs(ctx, config);
-      updateStatus(ctx, config);
-      return true;
-    } catch (error) {
-      sandboxEnabled = false;
-      ctx.ui.notify(
-        `Sandbox initialization failed: ${error instanceof Error ? error.message : error}`,
-        "error",
-      );
-      return false;
-    }
+    });
   }
 
   async function disableSandbox(
@@ -188,20 +190,22 @@ export default function (pi: ExtensionAPI) {
 
     hostBash?.stop();
     cancelPermissionPrompts(pi);
-    await background.tasks.stopAll();
-    if (sandboxInitialized) {
-      try {
-        await reviewSandbox.reset();
-        await sandboxManager.reset();
-      } catch {
-        // Ignore cleanup errors.
+    // No task may start while the sandbox is torn down.
+    return background.whileStopped(async () => {
+      if (sandboxInitialized) {
+        try {
+          await reviewSandbox.reset();
+          await sandboxManager.reset();
+        } catch {
+          // Ignore cleanup errors.
+        }
       }
-    }
-    sandboxEnabled = false;
-    sandboxInitialized = false;
-    clearSessionAllowances(allowances);
-    ctx.ui.setStatus("sandbox", "");
-    return true;
+      sandboxEnabled = false;
+      sandboxInitialized = false;
+      clearSessionAllowances(allowances);
+      ctx.ui.setStatus("sandbox", "");
+      return true;
+    });
   }
 
   async function toggleSandbox(ctx: Parameters<typeof warnIfAllDomainsAllowed>[0]): Promise<void> {
@@ -531,7 +535,17 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
+    // No task may start until the new session's sandbox is set up.
+    const release = background.tasks.hold();
+    try {
+      await startSession(event, ctx);
+    } finally {
+      release();
+    }
+  });
+
+  async function startSession(_event: unknown, ctx: ExtensionContext) {
     hostBash?.stop();
     await background.tasks.stopAll();
     projectTrusted = ctx.isProjectTrusted();
@@ -569,7 +583,7 @@ export default function (pi: ExtensionAPI) {
     }
     if (sandboxEnabled) hostBash?.start(ctx);
     await enableSandbox(ctx, true);
-  });
+  }
 
   pi.on("session_shutdown", async () => {
     hostBash?.stop();

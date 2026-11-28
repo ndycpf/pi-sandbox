@@ -8,6 +8,7 @@ import {
   type BackgroundTaskInfo,
   type BackgroundTasks,
   isLive,
+  Reservation,
   type WaitResult,
 } from "./background-tasks.ts";
 
@@ -76,7 +77,11 @@ export type BackgroundToolDeps = {
   /** Whether host_bash may start background tasks; shown in the tool guidance only. */
   hostBackground: boolean;
   /** Spawn a sandboxed (or, with the sandbox off, plain) background command. */
-  start: (command: string, ctx: ExtensionContext) => Promise<BackgroundTaskInfo>;
+  start: (
+    command: string,
+    ctx: ExtensionContext,
+    reservation: Reservation,
+  ) => Promise<BackgroundTaskInfo>;
 };
 
 const DEFAULT_WAIT_SECONDS = 60;
@@ -157,6 +162,13 @@ function waitedResult(
   });
 }
 
+/** Why a start got no slot, for the agent. */
+export function refusedStart(reason: "full" | "held", maxTasks: number) {
+  return reason === "full"
+    ? `Too many background tasks are running (limit ${maxTasks}, backgroundBash.maxTasks). Stop one first.`
+    : "Background tasks cannot start right now: the sandbox is being turned on or off, or the session is ending. Try again.";
+}
+
 export const BACKGROUND_TOOL = "bash_background";
 
 export function registerBackgroundTool(pi: ExtensionAPI, deps: BackgroundToolDeps) {
@@ -235,12 +247,16 @@ export function registerBackgroundTool(pi: ExtensionAPI, deps: BackgroundToolDep
         }
         const command = params.command?.trim();
         if (!command) throw new Error("start needs a command.");
-        if (tasks.running() >= options.maxTasks) {
-          throw new Error(
-            `Too many background tasks are running (limit ${options.maxTasks}, backgroundBash.maxTasks). Stop one first.`,
-          );
+        // Held before the first await, so concurrent starts cannot pass the limit.
+        const slot = tasks.reserve(options.maxTasks);
+        if (!(slot instanceof Reservation))
+          throw new Error(refusedStart(slot.refused, options.maxTasks));
+        let info: BackgroundTaskInfo;
+        try {
+          info = await deps.start(params.command!, ctx, slot);
+        } finally {
+          slot.release();
         }
-        const info = await deps.start(params.command!, ctx);
         if (until === undefined && params.timeoutSeconds === undefined) {
           return textResult(`Started ${describeTask(info)}`, info);
         }

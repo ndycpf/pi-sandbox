@@ -256,6 +256,32 @@ export function statusText(tasks: BackgroundTaskInfo[]): string | undefined {
   return `bg: ${live.length} running` + (extra.length ? ` (${extra.join(", ")})` : "");
 }
 
+const WIDGET_MAX_TASKS = 5;
+const WIDGET_COMMAND_CHARS = 60;
+
+function oneLine(command: string) {
+  const flat = command.replace(/\s+/g, " ").trim();
+  return flat.length > WIDGET_COMMAND_CHARS ? flat.slice(0, WIDGET_COMMAND_CHARS - 1) + "…" : flat;
+}
+
+/**
+ * Widget lines for the running tasks, or undefined when none run. Plain
+ * strings, so RPC clients get them too (Pi drops component widgets there).
+ */
+export function widgetLines(tasks: BackgroundTaskInfo[]): string[] | undefined {
+  const live = tasks.filter((task) => task.state !== "exited");
+  if (!live.length) return undefined;
+  const lines = live.slice(0, WIDGET_MAX_TASKS).map((task) => {
+    const where =
+      task.kind === "sandbox" ? "sandbox" : task.kind === "host" ? "HOST" : "no sandbox";
+    const state = task.state === "stopping" ? " (stopping)" : "";
+    return `${task.id} [${where}]${state} ${oneLine(task.command)}`;
+  });
+  if (live.length > WIDGET_MAX_TASKS)
+    lines.push(`+${live.length - WIDGET_MAX_TASKS} more (/background)`);
+  return lines;
+}
+
 export function exitMessage({ info, tail }: BackgroundExit) {
   return (
     `Background task ${describeTask(info)}` +

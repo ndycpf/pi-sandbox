@@ -416,10 +416,14 @@ after enabling it. The agent calls it with an `action`:
   and `stop` sends SIGTERM to the task's process group, then SIGKILL after 2
   seconds.
 
-While tasks run, the footer shows their count, such as `bg: 2 running (1 host)`.
-`/background` lists the tasks and `/background stop <id|all>` stops them; both
-work in the TUI and in RPC clients (the result is sent as a notification, and
-the footer text as a status update the client may show).
+While tasks run, the footer shows their count, such as `bg: 2 running (1 host)`,
+and a widget below the editor lists up to five of them, one line each
+(`bg1 [sandbox] npm run dev`, with `HOST` for host tasks). Both are cleared when
+no task runs. They are plain text, so RPC clients get them too, as `setStatus`
+and `setWidget` (string lines) UI requests; whether they are shown is up to the
+client. `/background` lists the tasks; `/background stop` asks which one to stop
+(Pi's selector in the TUI, a select dialog in RPC clients), and
+`/background stop <id|all>` stops without asking.
 
 When a task exits on its own, its status and output tail are added to the
 conversation. Every task is stopped when the session ends (including `/new`

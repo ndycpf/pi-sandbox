@@ -18,6 +18,7 @@ import {
   exitMessage,
   registerBackgroundTool,
   statusText,
+  widgetLines,
 } from "./background.ts";
 import {
   addDomainToConfig,
@@ -85,7 +86,10 @@ export default function (pi: ExtensionAPI) {
   // Long-running tasks belong to this session and this sandbox: they are
   // stopped on shutdown and whenever the sandbox is turned on or off.
   // The UI of the current session, for the footer count of running tasks.
-  let backgroundUi: { setStatus(key: string, text: string | undefined): void } | undefined;
+  // Plain text in RPC: the status and widget are sent to the client as-is.
+  let backgroundUi:
+    | { ui: Parameters<typeof showPermissionPrompt>[1]["ui"]; tui: boolean }
+    | undefined;
   const backgroundTasks = new BackgroundTasks(
     (exit) => {
       try {
@@ -99,7 +103,12 @@ export default function (pi: ExtensionAPI) {
     },
     () => {
       try {
-        backgroundUi?.setStatus("background", statusText(backgroundTasks.list()));
+        if (!backgroundUi) return;
+        const { ui, tui } = backgroundUi;
+        const all = backgroundTasks.list();
+        const status = statusText(all);
+        ui.setStatus("background", status && tui ? ui.theme.fg("accent", status) : status);
+        ui.setWidget("background", widgetLines(all), { placement: "belowEditor" });
       } catch {
         // The session may be gone.
       }
@@ -374,7 +383,7 @@ export default function (pi: ExtensionAPI) {
 
   function registerBackgroundCommand() {
     pi.registerCommand("background", {
-      description: "List background tasks, or stop one: /background stop <id|all>",
+      description: "List background tasks, or stop them: /background stop [id|all]",
       handler: async (args, ctx) => {
         const [action = "list", target] = args.trim().split(/\s+/).filter(Boolean);
         if (action === "list") {
@@ -390,6 +399,25 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Stopped all background tasks.", "info");
           return;
         }
+        if (action === "stop" && !target) {
+          // Pick a task: Pi's selector in the TUI, a select dialog in RPC clients.
+          const live = backgroundTasks.list().filter((task) => task.state !== "exited");
+          if (!live.length) {
+            ctx.ui.notify("No background tasks are running.", "info");
+            return;
+          }
+          if (!ctx.hasUI) {
+            ctx.ui.notify("Usage: /background stop <id|all>", "error");
+            return;
+          }
+          const lines = live.map(describeTask);
+          const choice = await ctx.ui.select("Stop which background task?", lines);
+          const task = choice === undefined ? undefined : live[lines.indexOf(choice)];
+          if (!task) return;
+          const stopped = await backgroundTasks.stop(task.id);
+          if (stopped) ctx.ui.notify(`Stopped: ${describeTask(stopped)}`, "info");
+          return;
+        }
         if (action === "stop" && target) {
           const stopped = await backgroundTasks.stop(target);
           ctx.ui.notify(
@@ -398,7 +426,7 @@ export default function (pi: ExtensionAPI) {
           );
           return;
         }
-        ctx.ui.notify("Usage: /background [list] | /background stop <id|all>", "error");
+        ctx.ui.notify("Usage: /background [list] | /background stop [id|all]", "error");
       },
     });
   }
@@ -622,7 +650,7 @@ export default function (pi: ExtensionAPI) {
     const startupConfig = loadConfig(ctx.cwd, projectTrusted);
     const hostBackground =
       startupConfig.hostBash?.enabled === true && startupConfig.hostBash.allowBackground === true;
-    backgroundUi = ctx.ui;
+    backgroundUi = ctx.hasUI ? { ui: ctx.ui, tui: ctx.mode === "tui" } : undefined;
     if (!backgroundToolRegistered && (startupConfig.backgroundBash?.enabled || hostBackground)) {
       backgroundToolRegistered = true;
       registerBackgroundCommand();
